@@ -539,7 +539,8 @@ class vLLMColocateWorkerExtension:
     def update_weights_from_m2n(self, update_info: dict) -> dict:
         """Receive one ``nccl_m2n`` update in this worker (``update_info`` from the checkpoint
         engine's ``receive_weights``). Tensors whose rank-local box is one contiguous parameter
-        view are written there by M2N; the rest are received into staging buffers and loaded."""
+        view (stacked experts: the FusedMoE weight itself) are written there by M2N; the rest are
+        received into staging buffers and loaded."""
         import time
 
         from vllm.distributed import parallel_state as ps
@@ -572,7 +573,7 @@ class vLLMColocateWorkerExtension:
             params = dict(model.named_parameters())
 
             def direct(it):
-                sc = plan.scatters.get(it.name)
+                sc = plan.scatters.get(it.name) or rank_local_bake.stacked_scatter(plan, it.name, it.dst.local_shape)
                 if sc is None or sc.shape != it.dst.local_shape:
                     return None
                 p = params[sc.param]

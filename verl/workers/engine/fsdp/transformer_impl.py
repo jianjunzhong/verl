@@ -892,9 +892,10 @@ class FSDPEngine(BaseEngine):
 
         return _gen(), None
 
-    def get_hf_shard_source(self):
+    def get_hf_shard_source(self, stack_experts: bool = False):
         """The cached :class:`~.hf_shard_source.FSDPHFShardSource` of this engine: local HF
-        shards with their boxes, for point-to-point checkpoint engines."""
+        shards with their boxes, for point-to-point checkpoint engines. transformers-v5 MoE
+        experts are stacked in the model already, whatever ``stack_experts`` says."""
         source = getattr(self, "_hf_shard_source", None)
         if source is None:
             from .hf_shard_source import FSDPHFShardSource

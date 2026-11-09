@@ -80,7 +80,15 @@ import torch.distributed as dist
 import zmq
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl.checkpoint_engine.nccl_m2n_plan import Piece, PlanItem, Side, build_channel_plan, plan_digest, split_buckets
+from verl.checkpoint_engine.nccl_m2n_plan import (
+    Piece,
+    PlanItem,
+    Side,
+    build_channel_plan,
+    plan_digest,
+    split_buckets,
+    unstack,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 try:
@@ -304,7 +312,9 @@ class M2NReceiver:
         self.manifest_digest: Optional[str] = None
         self.broken: Optional[str] = None
         self.last_counts = {"direct": 0, "staged": 0, "bytes": 0}
+        self.rank: Optional[int] = None
         self._bufs: list[torch.Tensor] = []
+        self._items: dict[str, PlanItem] = {}
 
     def take_manifests(self, rep: dict) -> None:
         if "manifests" in rep:
@@ -318,6 +328,7 @@ class M2NReceiver:
         if self.manifests is None or self.manifest_digest != rep["manifest_digest"]:
             raise RuntimeError("nccl_m2n: this receiver does not have the trainer manifests of the update")
         info = rep["channel"]
+        self.rank = replica_rank
         if rep["gen"] == self.gen and info["uids"] == self.uids:
             return
         # new replica, or the trainer started a new generation (possibly while this one was parked)
@@ -340,10 +351,12 @@ class M2NReceiver:
         for i in range(max(len(chans[k].buckets) for k in keys)):
             units += [(k, chans[k].buckets[i]) for k in keys if i < len(chans[k].buckets)]
         targets, need = {}, 0
+        self._items = {}
         for _k, bucket in units:
             staged = 0
             for group in bucket:
                 for it in group:
+                    self._items[it.name] = it
                     t = direct(it) if direct is not None and it.dst.shard_dim is not None else None
                     if t is not None:
                         targets[it.name] = t
@@ -379,7 +392,7 @@ class M2NReceiver:
     def _account(self, staged: dict) -> list:
         self.last_counts["staged"] += len(staged)
         self.last_counts["bytes"] += sum(t.numel() * t.element_size() for t in staged.values())
-        return list(staged.items())
+        return [p for name, t in staged.items() for p in unstack(self._items[name], t, self.rank)]
 
     def _done(self) -> None:
         torch.cuda.synchronize()
@@ -432,6 +445,8 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         max_channels: communicators a trainer sender keeps per handle epoch, parked ones included
             (nccl-extensions 0.1.0 allows 128 per handle, and fewer with NVLS). A join beyond it
             resets every rank to a new generation.
+        stack_experts: ask the trainer engine for stacked MoE expert tensors (one reshard per layer
+            and projection kind instead of one per expert) where its layout allows it.
     """
 
     send_weights_takes_engine = True
@@ -444,12 +459,14 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         group_bytes: int = 0,
         sync_timeout_s: float = 600.0,
         max_channels: int = 32,
+        stack_experts: bool = True,
     ) -> None:
         self.bucket_size = bucket_size
         self.is_master = is_master
         self.group_bytes = int(group_bytes)
         self.sync_timeout_s = float(sync_timeout_s)
         self.max_channels = int(max_channels)
+        self.stack_experts = bool(stack_experts)
 
         self._is_rollout = False
         self._layout = None
@@ -642,6 +659,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
                 "digests": {st: plan_digest(p) for st, p in plans.items()},
                 "sizes": {st: len(self._manifests[st]) + D for st in self._manifests},
                 "plan": plans.get(self._stage) if self._sender is not None else None,
+                "items": sum(len(p) for p in plans.values()),
             }
 
         if self._server is not None:
@@ -681,7 +699,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         if self._broken is not None:
             raise RuntimeError(f"nccl_m2n engine is unusable after a failed transfer ({self._broken}); restart it")
         t0 = time.perf_counter()
-        source = engine.get_hf_shard_source()
+        source = engine.get_hf_shard_source(stack_experts=self.stack_experts)
         shards = list(source.iter_shards())
         t_export = time.perf_counter()
         if self._manifests is None:
@@ -695,6 +713,9 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
             "nccl_m2n/membership_s": t_plan - t_export,
             **{f"nccl_m2n/{k}": v for k, v in stats.items()},
         }
+        if self._active:
+            # reshards per sync of one replica, over all stages
+            metrics["nccl_m2n/items"] = self._known[self._active[0]]["items"]
         channels = [self._ep.channels[rid] for rid in self._active if rid in self._ep.channels]
         if not channels:
             return metrics

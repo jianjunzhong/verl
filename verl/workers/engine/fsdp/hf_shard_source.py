@@ -20,6 +20,9 @@ M2N local shape; that tensor alone is gathered with ``full_tensor()`` and shippe
 
 Under HSDP only the ranks at coordinate 0 of every replicate mesh dim send; the others still take
 part in the gathers.
+
+transformers-v5 MoE models already keep their experts stacked per layer; they go out in the
+``nccl_m2n`` stacked-expert format (:mod:`verl.checkpoint_engine.nccl_m2n_plan`).
 """
 
 from __future__ import annotations
@@ -99,5 +102,20 @@ class FSDPHFShardSource:
                 continue
             if local.is_floating_point() and local.dtype != torch.bfloat16:
                 local = local.to(torch.bfloat16)
-            meta = HFShardMeta(meta.name, meta.global_shape, local.dtype, meta.offset, meta.local_shape)
+            meta = _restack(HFShardMeta(meta.name, meta.global_shape, local.dtype, meta.offset, meta.local_shape))
             yield name, local.reshape(meta.local_shape), meta
+
+
+def _restack(meta: HFShardMeta) -> HFShardMeta:
+    """transformers-v5 stacked ``gate_up_proj`` ``[E, 2I, H]`` (gate rows, then up rows, per expert)
+    as the ``[2E, I, H]`` of the ``nccl_m2n`` stacked-expert format. A box cut on the expert dim only
+    stays a box."""
+    from verl.checkpoint_engine.nccl_m2n_plan import stacked_kind
+
+    sk = stacked_kind(meta.name)
+    if sk is None or sk[1] != "gate_up_proj" or len(meta.global_shape) != 3:
+        return meta
+    (n_e, two_i, h), (o_e, o_i, o_h), (l_e, l_i, l_h) = meta.global_shape, meta.offset, meta.local_shape
+    if two_i % 2 or o_i or o_h or l_i != two_i or l_h != h:
+        raise ValueError(f"{meta.name}: box {meta.offset}+{meta.local_shape} splits the gate/up rows of an expert")
+    return HFShardMeta(meta.name, (2 * n_e, two_i // 2, h), meta.dtype, (2 * o_e, 0, 0), (2 * l_e, two_i // 2, h))

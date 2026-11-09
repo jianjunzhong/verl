@@ -193,6 +193,31 @@ def bake(model: torch.nn.Module, model_path: str) -> RankLocalPlan:
     return plan
 
 
+def stacked_scatter(plan: RankLocalPlan, name: str, local_shape: tuple[int, ...]) -> Scatter | None:
+    """The view a stacked expert box (``nccl_m2n_plan`` stacked names) of ``local_shape`` lands in,
+    if the per-expert boxes of its rows tile one parameter contiguously in row order (as FusedMoE's
+    ``w13_weight`` / ``w2_weight`` without expert parallelism); ``None`` otherwise."""
+    from verl.checkpoint_engine.nccl_m2n_plan import expert_names, stacked_kind
+
+    sk = stacked_kind(name)
+    if sk is None or len(local_shape) != 3:
+        return None
+    prefix, kind = sk
+    per = 2 if kind == "gate_up_proj" else 1
+    rows = [n for e in range(local_shape[0] // per) for n in expert_names(prefix, kind, e)]
+    scs = [plan.scatters.get(n) for n in rows]
+    row_shape = tuple(local_shape[1:])
+    row_stride = (row_shape[1], 1)
+    step = row_shape[0] * row_shape[1]
+    first = scs[0]
+    for r, sc in enumerate(scs):
+        if sc is None or sc.param != first.param or sc.shape != row_shape or sc.stride != row_stride:
+            return None
+        if sc.offset != first.offset + r * step:
+            return None
+    return Scatter(first.param, first.offset, tuple(local_shape), (step, *row_stride))
+
+
 def apply(model: torch.nn.Module, plan: RankLocalPlan, weights):
     """Copy every received box straight into its parameter view; return the rest for ``load_weights``.
 

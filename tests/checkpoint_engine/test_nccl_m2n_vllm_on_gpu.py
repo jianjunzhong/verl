@@ -50,17 +50,18 @@ def _mismatches(self):
 
 @ray.remote(num_gpus=2)
 class _VLLMReplica:
-    def __init__(self, model_path: str, tp: int):
+    def __init__(self, model_path: str, tp: int, skip_tokenizer_init: bool = False, max_model_len: int = 1024):
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"  # collective_rpc with test functions
         from vllm import LLM
 
         self.llm = LLM(
             model=model_path,
+            skip_tokenizer_init=skip_tokenizer_init,
             tensor_parallel_size=tp,
             dtype="bfloat16",
             enforce_eager=True,
             gpu_memory_utilization=0.3,
-            max_model_len=1024,
+            max_model_len=max_model_len,
             distributed_executor_backend="mp",
             worker_extension_cls="verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
         )
@@ -74,13 +75,19 @@ class _VLLMReplica:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("group_bytes", [0])
-async def test_nccl_m2n_into_vllm(group_bytes, num_trainer=2, rollout_tp=2, num_replicas=2, bucket_size_mb=64):
+@pytest.mark.parametrize("moe", [False, True])
+async def test_nccl_m2n_into_vllm(group_bytes, moe, num_trainer=2, rollout_tp=2, num_replicas=2, bucket_size_mb=64):
+    """``moe``: a tiny Qwen3-MoE, whose stacked transformers-v5 experts (FSDP2 shards on the expert
+    dim) land straight in FusedMoE's ``w13_weight`` / ``w2_weight``."""
+    from tests.checkpoint_engine.test_nccl_m2n_on_gpu import _tiny_moe
     from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import NCCLM2NCheckpointEngine, _Client
     from verl.single_controller.ray.base import RayResourcePool
 
     if num_trainer + rollout_tp * num_replicas > _ngpus:
         pytest.skip("not enough GPUs")
-    model_path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen/Qwen3-0.6B"))
+    tokenizer_path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen/Qwen3-0.6B"))
+    # tied: FSDP2 meta-device init of an untied model fails with transformers 5.5 + accelerate 1.12
+    model_path = _tiny_moe(tied=True) if moe else tokenizer_path
     # vLLM's NVLS communicators and the M2N windows exhaust the NVSwitch multicast pool otherwise
     ray.init(runtime_env={"env_vars": {"VERL_LOGGING_LEVEL": "INFO", "NCCL_NVLS_ENABLE": "0"}})
     config = CheckpointEngineConfig(
@@ -88,11 +95,18 @@ async def test_nccl_m2n_into_vllm(group_bytes, num_trainer=2, rollout_tp=2, num_
         update_weights_bucket_megabytes=bucket_size_mb,
         engine_kwargs={"nccl_m2n": {"group_bytes": group_bytes}},
     )
-    model_config = HFModelConfig(path=model_path, use_remove_padding=True)
+    # the borrowed tokenizer's special ids are beyond the tiny model's vocab
+    override = {k: 0 for k in ("bos_token_id", "eos_token_id", "pad_token_id")} if moe else {}
+    model_config = HFModelConfig(
+        path=model_path, tokenizer_path=tokenizer_path, use_remove_padding=True, override_config=override
+    )
     trainer_pool = RayResourcePool(process_on_nodes=[num_trainer], max_colocate_count=3)
     actor_wg = create_trainer_worker_group(trainer_pool, model_config, config, strategy="fsdp2")
     actor_wg.reset()
-    replicas = [_VLLMReplica.remote(model_path, rollout_tp) for _ in range(num_replicas)]
+    replicas = [
+        _VLLMReplica.remote(model_path, rollout_tp, skip_tokenizer_init=moe, max_model_len=256 if moe else 1024)
+        for _ in range(num_replicas)
+    ]
     layouts = ray.get([r.rpc.remote("get_weight_ownership") for r in replicas])
     for lay in layouts:
         assert [x["tp_rank"] for x in lay] == list(range(rollout_tp))

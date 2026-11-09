@@ -168,13 +168,14 @@ class BaseEngine:
         """
         raise NotImplementedError(f"{type(self).__name__} does not support trainer-side rollout quantization")
 
-    def get_hf_shard_source(self):
+    def get_hf_shard_source(self, stack_experts: bool = False):
         """A shard source for point-to-point checkpoint engines (``nccl_m2n``).
 
         The source has ``iter_shards()`` yielding ``(hf_name, local_view, HFShardMeta)`` (see
         :mod:`verl.workers.engine.hf_shard`) for every HF tensor piece this rank sends, without
         gathering, plus ``sender_index`` (this rank's index among the senders of its pipeline stage,
-        ``None`` if it sends nothing) and ``stage``.
+        ``None`` if it sends nothing) and ``stage``. ``stack_experts``: emit MoE experts stacked per
+        layer where the layout allows (see :mod:`verl.checkpoint_engine.nccl_m2n_plan`).
         """
         raise NotImplementedError(f"{type(self).__name__} does not export local HF shards")
 

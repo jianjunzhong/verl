@@ -28,16 +28,36 @@ the replica's rollout ranks in TP order. Every tensor becomes a :class:`PlanItem
 
 The plan only depends on the manifests and layouts, so trainer and rollout ranks build it on their
 own and compare a digest instead of shipping per-weight metadata on every step.
+
+MoE experts may travel stacked per layer under the transformers-v5 names (one call per layer instead
+of one per expert): ``<layer>.mlp.experts.gate_up_proj`` described as ``[2E, I, H]`` (row ``2e`` is
+expert ``e``'s ``gate_proj``, ``2e + 1`` its ``up_proj``) and ``<layer>.mlp.experts.down_proj`` as
+``[E, H, I]``. Their destination boxes are derived from the per-expert ``slices``, and receivers
+turn them back into per-expert views with :func:`unstack`.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
-__all__ = ["Piece", "Side", "PlanItem", "build_channel_plan", "plan_digest", "split_buckets", "MAX_TENSOR_DIMS"]
+__all__ = [
+    "Piece",
+    "Side",
+    "PlanItem",
+    "build_channel_plan",
+    "plan_digest",
+    "split_buckets",
+    "stacked_kind",
+    "expert_names",
+    "unstack",
+    "MAX_TENSOR_DIMS",
+]
+
+_STACKED = re.compile(r"^(?P<prefix>.+)\.mlp\.experts\.(?P<kind>gate_up_proj|down_proj)$")
 
 MAX_TENSOR_DIMS = 3
 # M2N v0.2: at most 16 source ranks feed one destination shard
@@ -183,12 +203,63 @@ def build_channel_plan(
 def _dst_dim(name: str, shape: tuple[int, ...], dst_slices: Sequence[Optional[dict]]) -> Optional[int]:
     boxes = []
     for slices in dst_slices:
-        entry = (slices or {}).get(name)
+        entry = (slices or {}).get(name) or _stacked_entry(name, shape, slices or {})
         if entry is None or tuple(entry["full_shape"]) != shape:
             return None
         boxes.append((tuple(int(b[0]) for b in entry["box"]), tuple(int(b[1]) for b in entry["box"])))
     sd = _even_split(boxes, shape) if boxes else None
     return None if sd is None or sd < 0 else sd
+
+
+def stacked_kind(name: str) -> Optional[tuple[str, str]]:
+    """``(layer prefix, "gate_up_proj" | "down_proj")`` for a stacked expert name, else ``None``."""
+    m = _STACKED.match(name)
+    return (m["prefix"], m["kind"]) if m else None
+
+
+def expert_names(prefix: str, kind: str, e: int) -> list[str]:
+    base = f"{prefix}.mlp.experts.{e}."
+    if kind == "gate_up_proj":
+        return [base + "gate_proj.weight", base + "up_proj.weight"]
+    return [base + "down_proj.weight"]
+
+
+def _stacked_entry(name: str, shape: tuple[int, ...], slices: dict) -> Optional[dict]:
+    """The box of a stacked expert tensor on one rollout rank, if every expert's per-expert boxes are
+    the same (each expert sliced alike, as TP does); ``None`` (full) otherwise."""
+    sk = stacked_kind(name)
+    if sk is None or len(shape) != 3:
+        return None
+    prefix, kind = sk
+    n_rows = 2 if kind == "gate_up_proj" else 1
+    box = None
+    for e in range(shape[0] // n_rows):
+        for n in expert_names(prefix, kind, e):
+            entry = slices.get(n)
+            if entry is None or tuple(entry["full_shape"]) != tuple(shape[1:]):
+                return None
+            b = tuple((int(s), int(c)) for s, c in entry["box"])
+            if box is None:
+                box = b
+            elif b != box:
+                return None
+    return {"full_shape": list(shape), "box": [[0, shape[0]], *[list(b) for b in box]]}
+
+
+def unstack(item: PlanItem, tensor, rank: int) -> list[tuple[str, object]]:
+    """Per-expert views of a received stacked expert tensor (``rank``: this receiver's index on the
+    destination side). Other items come back as ``[(name, tensor)]``."""
+    sk = stacked_kind(item.name)
+    if sk is None or len(item.global_shape) != 3:
+        return [(item.name, tensor)]
+    prefix, kind = sk
+    n_rows = 2 if kind == "gate_up_proj" else 1
+    first = rank * item.dst.local_shape[0] if item.dst.shard_dim == 0 else 0
+    out = []
+    for row in range(tensor.shape[0]):
+        e, part = divmod(first + row, n_rows)
+        out.append((expert_names(prefix, kind, e)[part], tensor[row]))
+    return out
 
 
 def plan_digest(items: Iterable[PlanItem]) -> str:

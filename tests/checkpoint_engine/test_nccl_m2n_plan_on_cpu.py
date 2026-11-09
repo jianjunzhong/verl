@@ -12,8 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pytest
+import torch
 
-from verl.checkpoint_engine.nccl_m2n_plan import Piece, Side, build_channel_plan, plan_digest, split_buckets
+from verl.checkpoint_engine.nccl_m2n_plan import (
+    Piece,
+    PlanItem,
+    Side,
+    build_channel_plan,
+    plan_digest,
+    split_buckets,
+    unstack,
+)
 
 
 def _pieces(name, shape, n, dim):
@@ -103,6 +112,79 @@ def test_digest_is_deterministic_and_layout_sensitive():
     a = plan_digest(build_channel_plan(man, [None, None]))
     assert a == plan_digest(build_channel_plan(man, [None, None]))
     assert a != plan_digest(build_channel_plan(man, q))
+
+
+def _expert_slices(prefix, n_e, inter, hidden, tp):
+    """Per-expert TP slices as vLLM's FusedMoE loader keeps them: gate/up on rows, down on cols."""
+    out = []
+    for k in range(tp):
+        s, n = k * inter // tp, inter // tp
+        sl = {}
+        for e in range(n_e):
+            base = f"{prefix}.mlp.experts.{e}."
+            for p in ("gate_proj", "up_proj"):
+                sl[base + p + ".weight"] = {"full_shape": [inter, hidden], "box": [[s, n], [0, hidden]]}
+            sl[base + "down_proj.weight"] = {"full_shape": [hidden, inter], "box": [[0, hidden], [s, n]]}
+        out.append(sl)
+    return out
+
+
+def test_stacked_experts_take_the_per_expert_destination_boxes():
+    E, inter, hidden, pre = 4, 8, 6, "model.layers.0"
+    gu, dn = f"{pre}.mlp.experts.gate_up_proj", f"{pre}.mlp.experts.down_proj"
+    # EP=2 senders: each holds 2 experts of both stacks
+    man = _manifests((gu, (2 * E, inter, hidden), 0), (dn, (E, hidden, inter), 0))
+    plan = build_channel_plan(man, _expert_slices(pre, E, inter, hidden, 2))
+    by = {it.name: it for it in plan}
+    assert by[gu].src == Side(0, 2, 0, (E, inter, hidden))
+    assert by[gu].dst == Side(2, 2, 1, (2 * E, inter // 2, hidden))
+    assert by[dn].dst == Side(2, 2, 2, (E, hidden, inter // 2))
+
+    t = torch.arange(2 * E * 4 * hidden).view(2 * E, 4, hidden)
+    names = [n for n, _ in unstack(by[gu], t, rank=1)]
+    assert names[:3] == [f"{pre}.mlp.experts.0.gate_proj.weight", f"{pre}.mlp.experts.0.up_proj.weight"] + [
+        f"{pre}.mlp.experts.1.gate_proj.weight"
+    ]
+    assert torch.equal(unstack(by[gu], t, rank=1)[3][1], t[3])
+    assert unstack(PlanItem("x", (2,), "bfloat16", by[gu].src, by[gu].dst), t, 0) == [("x", t)]
+
+    # one expert sliced differently: the stack goes full
+    odd = _expert_slices(pre, E, inter, hidden, 2)
+    odd[0][f"{pre}.mlp.experts.3.down_proj.weight"]["box"] = [[0, hidden], [0, inter]]
+    by = {it.name: it for it in build_channel_plan(man, odd)}
+    assert by[dn].dst.shard_dim is None and by[gu].dst.shard_dim == 1
+
+
+def test_stacked_scatter_needs_contiguous_expert_rows():
+    from verl.workers.rollout.vllm_rollout.rank_local_bake import RankLocalPlan, Scatter, stacked_scatter
+
+    E, rows, hidden, pre = 3, 4, 6, "model.layers.0"
+    gu = f"{pre}.mlp.experts.gate_up_proj"
+    plan = RankLocalPlan()
+    for e in range(E):
+        for j, p in enumerate(("gate_proj", "up_proj")):
+            off = (2 * e + j) * rows * hidden
+            plan.scatters[f"{pre}.mlp.experts.{e}.{p}.weight"] = Scatter("w13", off, (rows, hidden), (hidden, 1))
+    sc = stacked_scatter(plan, gu, (2 * E, rows, hidden))
+    assert sc == Scatter("w13", 0, (2 * E, rows, hidden), (rows * hidden, hidden, 1))
+    # up before gate (a swapped kernel layout): no single view
+    a, b = (f"{pre}.mlp.experts.1.{p}.weight" for p in ("gate_proj", "up_proj"))
+    plan.scatters[a], plan.scatters[b] = plan.scatters[b], plan.scatters[a]
+    assert stacked_scatter(plan, gu, (2 * E, rows, hidden)) is None
+    assert stacked_scatter(plan, "model.layers.0.mlp.gate.weight", (2 * E, rows, hidden)) is None
+
+
+def test_fsdp_restack_gate_up():
+    from verl.workers.engine.fsdp.hf_shard_source import _restack
+    from verl.workers.engine.hf_shard import HFShardMeta
+
+    name = "model.layers.1.mlp.experts.gate_up_proj"
+    m = _restack(HFShardMeta(name, (8, 16, 6), torch.bfloat16, (4, 0, 0), (4, 16, 6)))
+    assert (m.global_shape, m.offset, m.local_shape) == ((16, 8, 6), (8, 0, 0), (8, 8, 6))
+    down = HFShardMeta("model.layers.1.mlp.experts.down_proj", (8, 6, 8), torch.bfloat16, (0, 0, 0), (8, 6, 8))
+    assert _restack(down) is down
+    with pytest.raises(ValueError, match="gate/up"):
+        _restack(HFShardMeta(name, (8, 16, 6), torch.bfloat16, (0, 8, 0), (8, 8, 6)))
 
 
 def test_split_buckets():

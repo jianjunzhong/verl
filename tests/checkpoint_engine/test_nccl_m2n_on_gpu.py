@@ -39,12 +39,12 @@ def _model_path():
     return os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen/Qwen3-8B"))
 
 
-def _tiny_moe() -> str:
+def _tiny_moe(tied: bool = False) -> str:
     """A random 2-layer Qwen3-MoE checkpoint (8 experts) with shapes every TP/EP/ETP here divides."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    path = "/tmp/tiny_qwen3_moe_nccl_m2n"
+    path = "/tmp/tiny_qwen3_moe_nccl_m2n" + ("_tied" if tied else "")
     if not os.path.exists(os.path.join(path, "model.safetensors")):
         cfg = AutoConfig.for_model(
             "qwen3_moe",
@@ -59,7 +59,7 @@ def _tiny_moe() -> str:
             head_dim=64,
             vocab_size=1024,
             max_position_embeddings=256,
-            tie_word_embeddings=False,
+            tie_word_embeddings=tied,
             decoder_sparse_step=1,
             mlp_only_layers=[],
         )
@@ -126,20 +126,24 @@ async def test_nccl_m2n_fsdp(shard_dst, group_bytes, num_trainer, rollout_tp):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "tp, pp, ep, etp, moe",
+    "tp, pp, ep, etp, moe, stack, items",
     [
-        (2, 2, 1, None, False),  # one channel per stage per replica, stages concurrent
-        (2, 1, 1, None, False),  # dp replicas do not send
-        (2, 1, 2, 1, True),  # experts from both expert-dp replicas, round-robin
-        (2, 1, 2, 2, True),  # ETP shards of every expert
-        (1, 2, 2, 1, True),  # TP1 dense from dp rank 0, experts from both ep ranks, per stage
+        (2, 2, 1, None, False, True, None),  # one channel per stage per replica, stages concurrent
+        (2, 1, 1, None, False, True, None),  # dp replicas do not send
+        # experts of a layer stacked per projection (2 x 2 layers + 21 others), from both expert-dp
+        # replicas, round-robin
+        (2, 1, 2, 1, True, True, 25),
+        (2, 1, 2, 1, True, False, 69),  # one item per expert projection (48 + 21)
+        (2, 1, 2, 2, True, True, 69),  # ETP shards of every expert: EP and ETP cut the stack twice
+        (1, 2, 2, 1, True, True, 25),  # TP1 dense from dp rank 0, experts from both ep ranks, per stage
     ],
 )
 @auto_await
-async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, num_trainer=4, rollout_tp=2):
+async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, stack, items, num_trainer=4, rollout_tp=2):
     """Megatron local shards (no TP gather) -> sharded rollout TP; checked against the checkpoint.
     MODEL_PATH (dense, also the tokenizer) must have a vocab that TP does not divide evenly after
-    Megatron's padding, so the embedding goes through the per-tensor gather fallback."""
+    Megatron's padding, so the embedding goes through the per-tensor gather fallback. ``items``:
+    reshards per sync of one replica."""
     from verl.workers.config import McoreEngineConfig
 
     engine_config = McoreEngineConfig(
@@ -153,7 +157,7 @@ async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, num_trainer=4, rollout_tp
     config, actor_wg, rollout, replicas = await _setup(
         num_trainer,
         rollout_tp,
-        {},
+        {"stack_experts": stack},
         shard_dst=True,
         bucket_size_mb=64,
         model_path=_tiny_moe() if moe else None,
@@ -164,6 +168,8 @@ async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, num_trainer=4, rollout_tp
         metrics = await manager.update_weights(global_steps=step)
         print(f"step {step}: {metrics}")
         assert min(rollout.check_weights()) > 0
+        if items is not None:
+            assert metrics["nccl_m2n/items"] == items, metrics
         # one channel per (stage, replica) on every sender
         assert metrics["nccl_m2n/opened"] == (len(replicas) if step == 0 else 0), metrics
     ray.shutdown()

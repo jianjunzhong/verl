@@ -1112,10 +1112,11 @@ class MegatronEngine(BaseEngine):
         gen, _ = self.get_per_tensor_param_shard()
         return hf_shard_export(gen, self._hf_delta_entry, with_indices), None
 
-    def get_hf_shard_source(self):
+    def get_hf_shard_source(self, stack_experts: bool = False):
         """The cached :class:`~.hf_shard_source.MegatronHFShardSource` of this engine: local
         HF shards with their boxes, for point-to-point checkpoint engines."""
-        source = getattr(self, "_hf_shard_source", None)
+        sources = self.__dict__.setdefault("_hf_shard_sources", {})
+        source = sources.get(stack_experts)
         if source is None or self.is_param_offload_enabled:
             # the source reads the live parameters; the caller offloads them again after the send
             load_megatron_model_to_gpu(self.module, load_grad=False)
@@ -1123,7 +1124,7 @@ class MegatronEngine(BaseEngine):
             from .hf_shard_source import MegatronHFShardSource
 
             self._mcore_export_index()
-            source = self._hf_shard_source = MegatronHFShardSource(self)
+            source = sources[stack_experts] = MegatronHFShardSource(self, stack_experts=stack_experts)
         return source
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
