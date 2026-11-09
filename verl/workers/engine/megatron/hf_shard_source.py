@@ -29,6 +29,11 @@ strided layouts) falls back for that tensor only: the ranks of its merge group
 all-gather their pieces and every one of them yields the full tensor as a
 ``Replicate`` box. The decision is agreed over WORLD at plan time so all ranks
 stay in lockstep.
+
+Senders: the ranks of a pipeline stage that ship anything (dp/cp and expert-dp
+replicas are deduplicated by the export index), numbered in global rank order.
+Megatron keeps TP (and ETP) ranks adjacent, so the holders of every HF tensor
+are a contiguous run of senders, as M2N source meshes need.
 """
 
 from __future__ import annotations
@@ -70,6 +75,9 @@ class MegatronHFShardSource:
         from megatron.core import parallel_state as mpu
 
         self._dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        self.stage = mpu.get_pipeline_model_parallel_rank()
+        # index among the senders of this stage, None if this rank ships nothing; set by plan()
+        self.sender_index: Optional[int] = None
 
     @property
     def planned(self) -> bool:
@@ -126,6 +134,16 @@ class MegatronHFShardSource:
             if row.fallback:
                 logger.warning("%s: HF output is not a dense box, exported via gather", row.rec.megatron_name)
         self._rows = rows
+        ships = any(
+            self._local(row.rec) is not None and (row.fallback or any(c for _m, c in row.metas)) for row in rows
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            every: list = [None] * dist.get_world_size()
+            dist.all_gather_object(every, (self.stage, ships))
+            senders = [r for r, (st, s) in enumerate(every) if st == self.stage and s]
+            self.sender_index = senders.index(dist.get_rank()) if ships else None
+        else:
+            self.sender_index = 0 if ships else None
 
     def fallback_names(self) -> list[str]:
         return [r.rec.megatron_name for r in self._rows or () if r.fallback]

@@ -1116,10 +1116,12 @@ class MegatronEngine(BaseEngine):
         """The cached :class:`~.hf_shard_source.MegatronHFShardSource` of this engine: local
         HF shards with their boxes, for point-to-point checkpoint engines."""
         source = getattr(self, "_hf_shard_source", None)
+        if source is None or self.is_param_offload_enabled:
+            # the source reads the live parameters; the caller offloads them again after the send
+            load_megatron_model_to_gpu(self.module, load_grad=False)
         if source is None:
             from .hf_shard_source import MegatronHFShardSource
 
-            load_megatron_model_to_gpu(self.module, load_grad=False)
             self._mcore_export_index()
             source = self._hf_shard_source = MegatronHFShardSource(self)
         return source

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import glob
 import os
 from typing import Generator
 
 import ray
 import torch
-from transformers import AutoModelForCausalLM
 
 from verl.checkpoint_engine import CheckpointEngineRegistry, CheckpointEngineWorker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -56,8 +56,6 @@ def mock_tp_slices(model_path: str, tp_size: int, tp_rank: int) -> dict:
     """vLLM-like TP boxes of a dense HF decoder: column-parallel weights split rows, row-parallel ones
     columns. ``layers.0`` k_proj gets the same box on every rank (like replicated KV heads), which
     is not a partition, so the engine must send it full."""
-    import glob
-
     from safetensors import safe_open
 
     manifest = {}
@@ -89,7 +87,7 @@ class MockServerAdapter(BaseRollout):
         super().__init__(config, model_config, device_mesh=None)
         self.check_allclose = check_allclose
         self.shard_dst = shard_dst
-        self.model = None
+        self.reference = None
         self.received_weights: dict[str, torch.Tensor] = {}
         self.slices: dict = {}
         self.kill_after: int | None = None
@@ -132,12 +130,20 @@ class MockServerAdapter(BaseRollout):
         if not self.check_allclose:
             return
 
-        if self.model is None:
-            local_path = copy_to_local(self.model_config.path)
-            self.model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.bfloat16, device_map="cpu")
+        if self.reference is None:
+            # checkpoint names (per-expert for MoE: transformers 5 stacks experts in memory only)
+            from safetensors import safe_open
+
+            self.reference = {}
+            for f in sorted(glob.glob(os.path.join(copy_to_local(self.model_config.path), "*.safetensors"))):
+                with safe_open(f, framework="pt") as st:
+                    self.reference.update({k: st.get_tensor(k).to(torch.bfloat16) for k in st.keys()})
+            if self.model_config.hf_config.tie_word_embeddings and "lm_head.weight" not in self.received_weights:
+                # Megatron has no output layer to ship for tied embeddings; the rollout ties it itself
+                self.reference.pop("lm_head.weight", None)
 
         boxes = 0
-        for name, weight in self.model.state_dict().items():
+        for name, weight in self.reference.items():
             assert name in self.received_weights, f"weight {name} not received"
             received = self.received_weights[name]
             if tuple(received.shape) != tuple(weight.shape):
@@ -200,10 +206,12 @@ def create_trainer_worker_group(
     checkpoint_engine_config: CheckpointEngineConfig,
     strategy: str = "fsdp",
     fsdp_size: int | None = None,
+    engine_config=None,
 ) -> RayWorkerGroup:
-    engine_config = FSDPEngineConfig(
-        forward_only=True, fsdp_size=fsdp_size or resource_pool.world_size, strategy=strategy
-    )
+    if engine_config is None:
+        engine_config = FSDPEngineConfig(
+            forward_only=True, fsdp_size=fsdp_size or resource_pool.world_size, strategy=strategy
+        )
     trainer_config = TrainingWorkerConfig(
         model_type="language_model",
         model_config=model_config,

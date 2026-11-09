@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end ``nccl_m2n``: FSDP2 trainer local shards -> rollout replicas, checked against the HF checkpoint.
+"""End-to-end ``nccl_m2n``: FSDP2 / Megatron trainer local shards -> rollout replicas, checked against the
+HF checkpoint.
 
 MODEL_PATH=~/models/Qwen/Qwen3-8B pytest -s tests/checkpoint_engine/test_nccl_m2n_on_gpu.py
 
@@ -34,21 +35,60 @@ _ngpus = get_torch_device().device_count()
 pytest.importorskip("nccl.m2n")
 
 
-async def _setup(num_trainer, rollout_tp, engine_kwargs, shard_dst, bucket_size_mb=512):
-    model_path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen/Qwen3-8B"))
+def _model_path():
+    return os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen/Qwen3-8B"))
+
+
+def _tiny_moe() -> str:
+    """A random 2-layer Qwen3-MoE checkpoint (8 experts) with shapes every TP/EP/ETP here divides."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    path = "/tmp/tiny_qwen3_moe_nccl_m2n"
+    if not os.path.exists(os.path.join(path, "model.safetensors")):
+        cfg = AutoConfig.for_model(
+            "qwen3_moe",
+            hidden_size=256,
+            intermediate_size=512,
+            moe_intermediate_size=128,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1024,
+            max_position_embeddings=256,
+            tie_word_embeddings=False,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+        )
+        cfg.architectures = ["Qwen3MoeForCausalLM"]
+        torch.manual_seed(0)
+        AutoModelForCausalLM.from_config(cfg).to(torch.bfloat16).save_pretrained(path, safe_serialization=True)
+    return path
+
+
+async def _setup(
+    num_trainer, rollout_tp, engine_kwargs, shard_dst, bucket_size_mb=512, model_path=None, engine_config=None
+):
     ray.init(runtime_env={"env_vars": {"VERL_LOGGING_LEVEL": "INFO"}})
     checkpoint_engine_config = CheckpointEngineConfig(
         backend="nccl_m2n",
         update_weights_bucket_megabytes=bucket_size_mb,
         engine_kwargs={"nccl_m2n": engine_kwargs},
     )
-    model_config = HFModelConfig(path=model_path, use_remove_padding=True)
+    model_config = HFModelConfig(
+        path=model_path or _model_path(), tokenizer_path=_model_path(), use_remove_padding=True
+    )
     rollout_config = RolloutConfig(
         name="vllm", tensor_model_parallel_size=rollout_tp, checkpoint_engine=checkpoint_engine_config
     )
     resource_pool = RayResourcePool(process_on_nodes=[_ngpus], max_colocate_count=3)
     trainer_pool, rollout_pool = split_resource_pool(resource_pool, [num_trainer, _ngpus - num_trainer])
-    actor_wg = create_trainer_worker_group(trainer_pool, model_config, checkpoint_engine_config, strategy="fsdp2")
+    actor_wg = create_trainer_worker_group(
+        trainer_pool, model_config, checkpoint_engine_config, strategy="fsdp2", engine_config=engine_config
+    )
     actor_wg.reset()
     rollout, replicas = await create_rollout_worker_group(
         rollout_pool, model_config, rollout_config, check_allclose=True, shard_dst=shard_dst
@@ -81,6 +121,51 @@ async def test_nccl_m2n_fsdp(shard_dst, group_bytes, num_trainer, rollout_tp):
         # channels are opened once per replica
         assert metrics["nccl_m2n/opened"] == (len(replicas) if step == 0 else 0), metrics
 
+    ray.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tp, pp, ep, etp, moe",
+    [
+        (2, 2, 1, None, False),  # one channel per stage per replica, stages concurrent
+        (2, 1, 1, None, False),  # dp replicas do not send
+        (2, 1, 2, 1, True),  # experts from both expert-dp replicas, round-robin
+        (2, 1, 2, 2, True),  # ETP shards of every expert
+        (1, 2, 2, 1, True),  # TP1 dense from dp rank 0, experts from both ep ranks, per stage
+    ],
+)
+@auto_await
+async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, num_trainer=4, rollout_tp=2):
+    """Megatron local shards (no TP gather) -> sharded rollout TP; checked against the checkpoint.
+    MODEL_PATH (dense, also the tokenizer) must have a vocab that TP does not divide evenly after
+    Megatron's padding, so the embedding goes through the per-tensor gather fallback."""
+    from verl.workers.config import McoreEngineConfig
+
+    engine_config = McoreEngineConfig(
+        forward_only=True,
+        use_mbridge=True,
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
+        expert_model_parallel_size=ep,
+        expert_tensor_parallel_size=etp,
+    )
+    config, actor_wg, rollout, replicas = await _setup(
+        num_trainer,
+        rollout_tp,
+        {},
+        shard_dst=True,
+        bucket_size_mb=64,
+        model_path=_tiny_moe() if moe else None,
+        engine_config=engine_config,
+    )
+    manager = CheckpointEngineManager(config=config, actor_wg=actor_wg, replicas=replicas)
+    for step in range(3):
+        metrics = await manager.update_weights(global_steps=step)
+        print(f"step {step}: {metrics}")
+        assert min(rollout.check_weights()) > 0
+        # one channel per (stage, replica) on every sender
+        assert metrics["nccl_m2n/opened"] == (len(replicas) if step == 0 else 0), metrics
     ray.shutdown()
 
 
