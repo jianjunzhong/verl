@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 from typing import Generator
 
 import ray
@@ -41,6 +42,8 @@ class TrainingWorkerTest(TrainingWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+        if getattr(self.checkpoint_engine, "send_weights_takes_engine", False):
+            return await self.checkpoint_engine.send_weights(self.engine, global_steps=global_steps)
         per_tensor_param, _ = self.engine.get_per_tensor_param()
         await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
@@ -49,12 +52,60 @@ class TrainingWorkerTest(TrainingWorker):
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
 
+def mock_tp_slices(model_path: str, tp_size: int, tp_rank: int) -> dict:
+    """vLLM-like TP boxes of a dense HF decoder: column-parallel weights split rows, row-parallel ones
+    columns. ``layers.0`` k_proj gets the same box on every rank (like replicated KV heads), which
+    is not a partition, so the engine must send it full."""
+    import glob
+
+    from safetensors import safe_open
+
+    manifest = {}
+    for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+        with safe_open(f, framework="pt") as st:
+            manifest.update({k: list(st.get_slice(k).get_shape()) for k in st.keys()})
+    col = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "gate_proj.weight", "up_proj.weight", "embed_tokens")
+    row = ("o_proj.weight", "down_proj.weight")
+    slices = {}
+    for name, shape in manifest.items():
+        d = 0 if any(k in name for k in col) or name == "lm_head.weight" else 1 if name.endswith(row) else None
+        if d is None or len(shape) != 2 or shape[d] % tp_size:
+            continue
+        box = [[0, n] for n in shape]
+        step = shape[d] // tp_size
+        box[d] = [0 if name.endswith("layers.0.self_attn.k_proj.weight") else tp_rank * step, step]
+        slices[name] = {"full_shape": list(shape), "box": box}
+    return slices
+
+
 class MockServerAdapter(BaseRollout):
-    def __init__(self, config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True):
+    def __init__(
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        check_allclose: bool = True,
+        shard_dst: bool = False,
+    ):
         super().__init__(config, model_config, device_mesh=None)
         self.check_allclose = check_allclose
+        self.shard_dst = shard_dst
         self.model = None
         self.received_weights: dict[str, torch.Tensor] = {}
+        self.slices: dict = {}
+
+    async def get_weight_ownership(self):
+        from verl.workers.rollout.base import RolloutLayout
+
+        tp = self.config.tensor_model_parallel_size
+        tp_rank = int(os.environ["RANK"]) % tp
+        if self.shard_dst and tp > 1:
+            self.slices = mock_tp_slices(copy_to_local(self.model_config.path), tp, tp_rank)
+        return RolloutLayout(
+            tp_size=tp,
+            tp_rank=tp_rank,
+            wire_formats=["named_tensors", "rank_local_named_tensors"],
+            slices=self.slices or None,
+        )
 
     async def resume(self, tags: list[str]):
         raise NotImplementedError()
@@ -80,14 +131,20 @@ class MockServerAdapter(BaseRollout):
             local_path = copy_to_local(self.model_config.path)
             self.model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.bfloat16, device_map="cpu")
 
+        boxes = 0
         for name, weight in self.model.state_dict().items():
             assert name in self.received_weights, f"weight {name} not received"
             received = self.received_weights[name]
+            if tuple(received.shape) != tuple(weight.shape):
+                entry = self.slices[name]
+                weight = weight[tuple(slice(s, s + n) for s, n in entry["box"])]
+                boxes += 1
             assert torch.allclose(weight.to(received.device, dtype=received.dtype), received), (
                 f"weight {name} not equal"
             )
         self.received_weights.clear()
-        print("Check passed, all weights are equal!")
+        print(f"Check passed, all weights are equal ({boxes} received as rank-local boxes)!")
+        return boxes
 
 
 class MockReplica(RolloutReplica):
@@ -112,20 +169,32 @@ class MockReplica(RolloutReplica):
 
 class CheckpointEngineWorkerTest(CheckpointEngineWorker):
     def __init__(
-        self, rollout_config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True, *args, **kwargs
+        self,
+        rollout_config: RolloutConfig,
+        model_config: HFModelConfig,
+        check_allclose: bool = True,
+        shard_dst: bool = False,
+        *args,
+        **kwargs,
     ) -> None:
-        server_adapter = MockServerAdapter(rollout_config, model_config, check_allclose)
+        server_adapter = MockServerAdapter(rollout_config, model_config, check_allclose, shard_dst)
         super().__init__(rollout_config, model_config, server_adapter, *args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def check_weights(self):
-        self.server_adapter.check_weights()
+        return self.server_adapter.check_weights()
 
 
 def create_trainer_worker_group(
-    resource_pool: RayResourcePool, model_config: HFModelConfig, checkpoint_engine_config: CheckpointEngineConfig
+    resource_pool: RayResourcePool,
+    model_config: HFModelConfig,
+    checkpoint_engine_config: CheckpointEngineConfig,
+    strategy: str = "fsdp",
+    fsdp_size: int | None = None,
 ) -> RayWorkerGroup:
-    engine_config = FSDPEngineConfig(forward_only=True, fsdp_size=resource_pool.world_size, strategy="fsdp")
+    engine_config = FSDPEngineConfig(
+        forward_only=True, fsdp_size=fsdp_size or resource_pool.world_size, strategy=strategy
+    )
     trainer_config = TrainingWorkerConfig(
         model_type="language_model",
         model_config=model_config,
@@ -155,6 +224,7 @@ async def create_rollout_worker_group(
     model_config: HFModelConfig,
     rollout_config: RolloutConfig,
     check_allclose: bool = True,
+    shard_dst: bool = False,
 ) -> tuple[RayWorkerGroup, list[MockReplica]]:
     # create rollout worker group
     ray_cls_with_init = RayClassWithInitArgs(
@@ -162,6 +232,7 @@ async def create_rollout_worker_group(
         model_config=model_config,
         rollout_config=rollout_config,
         check_allclose=check_allclose,
+        shard_dst=shard_dst,
     )
     wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init, device_name=get_device_name())
 

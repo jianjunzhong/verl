@@ -82,3 +82,11 @@ try:
 except ImportError as e:
     CheckpointEngineRegistry.record_import_error("delta_checkpoint_engine", e)
     DeltaShardedCheckpointEngine = None
+
+try:
+    from .nccl_m2n_checkpoint_engine import NCCLM2NCheckpointEngine
+
+    __all__ += ["NCCLM2NCheckpointEngine"]
+except ImportError as e:
+    CheckpointEngineRegistry.record_import_error("nccl_m2n_checkpoint_engine", e)
+    NCCLM2NCheckpointEngine = None

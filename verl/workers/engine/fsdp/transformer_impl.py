@@ -892,6 +892,16 @@ class FSDPEngine(BaseEngine):
 
         return _gen(), None
 
+    def get_hf_shard_source(self):
+        """The cached :class:`~.hf_shard_source.FSDPHFShardSource` of this engine: local HF
+        shards with their boxes, for point-to-point checkpoint engines."""
+        source = getattr(self, "_hf_shard_source", None)
+        if source is None:
+            from .hf_shard_source import FSDPHFShardSource
+
+            source = self._hf_shard_source = FSDPHFShardSource(self)
+        return source
+
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """Per-param HF delta entry builder: this engine handles DTensor identity
         params only (weight name == HF name, coordinates translate). EP/converter

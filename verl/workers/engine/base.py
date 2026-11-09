@@ -168,6 +168,16 @@ class BaseEngine:
         """
         raise NotImplementedError(f"{type(self).__name__} does not support trainer-side rollout quantization")
 
+    def get_hf_shard_source(self):
+        """A shard source for point-to-point checkpoint engines (``nccl_m2n``).
+
+        The source has ``iter_shards()`` yielding ``(hf_name, local_view, HFShardMeta)`` (see
+        :mod:`verl.workers.engine.hf_shard`) for every HF tensor piece this rank sends, without
+        gathering, plus ``sender_index`` (this rank's index among the senders of its pipeline stage,
+        ``None`` if it sends nothing) and ``stage``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not export local HF shards")
+
     def get_per_tensor_param_shard(self, **kwargs) -> tuple[Generator, Optional[dict]]:
         """
         Like :meth:`get_per_tensor_param`, but yields each rank's *local* parameter shard

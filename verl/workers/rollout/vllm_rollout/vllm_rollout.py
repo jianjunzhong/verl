@@ -206,6 +206,16 @@ class ServerAdapter(BaseRollout):
         if self.config.free_cache_engine and self._ensure_server_handle():
             await self.server_handle.sleep.remote()
 
+    async def get_weight_ownership(self):
+        """This worker's place in its replica as a ``RolloutLayout``, without ``slices``: every
+        tensor is delivered full. Only plain TP replicas are described; anything else is ``None``."""
+        from verl.workers.rollout.base import RolloutLayout
+
+        cfg = self.config
+        if self._pd_role is not None or cfg.data_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
+            return None
+        return RolloutLayout(tp_size=cfg.tensor_model_parallel_size, tp_rank=self.rollout_rank)
+
     @torch.no_grad()
     async def update_weights(
         self,
