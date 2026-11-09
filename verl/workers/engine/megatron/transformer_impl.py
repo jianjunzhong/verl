@@ -1103,6 +1103,27 @@ class MegatronEngine(BaseEngine):
         rec = self._delta_export_by_name[name]
         return mcore_hf_delta_entry(rec, place, lidx, lval, self._delta_slot_cache)
 
+    def get_per_tensor_param_hf_shard(self, with_indices: bool = True):
+        """Yield complete local shards converted into final HF coordinates.
+        ``with_indices=False`` yields ``hf_idx=None`` and skips the NaN probe
+        (cached source runs); values keep the ``with_indices=True`` order."""
+        from ..utils import hf_shard_export
+
+        gen, _ = self.get_per_tensor_param_shard()
+        return hf_shard_export(gen, self._hf_delta_entry, with_indices), None
+
+    def get_hf_shard_source(self):
+        """The cached :class:`~.hf_shard_source.MegatronHFShardSource` of this engine: local
+        HF shards with their boxes, for point-to-point checkpoint engines."""
+        source = getattr(self, "_hf_shard_source", None)
+        if source is None:
+            from .hf_shard_source import MegatronHFShardSource
+
+            load_megatron_model_to_gpu(self.module, load_grad=False)
+            self._mcore_export_index()
+            source = self._hf_shard_source = MegatronHFShardSource(self)
+        return source
+
     def get_per_tensor_param_delta_shard(self, **kwargs):
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         per mcore parameter (see the FSDP engine's method of the same name for the
