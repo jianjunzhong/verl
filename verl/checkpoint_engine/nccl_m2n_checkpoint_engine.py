@@ -22,6 +22,11 @@ Channels: one communicator + stream per (trainer PP stage, rollout replica). A r
 identified by the actor ids of its workers, so it keeps its channels for as long as its processes
 live, whatever else joins or leaves.
 
+Receivers: by default the checkpoint engine worker receives and hands named tensors to its rollout
+server. A rollout whose layout lists the ``nccl_m2n`` wire format receives in its own workers
+instead (vLLM: ``update_weights_from_m2n``): the checkpoint engine worker only forwards the
+channel info, and the workers write most tensors in place (:class:`M2NReceiver` ``direct``).
+
 Lifecycle:
 
 * ``prepare`` / ``build_topology`` / ``init_process_group`` run on every update but only record
@@ -50,6 +55,9 @@ nccl-extensions 0.1.0 rules this follows:
    cannot abort it in-process. A sync that misses ``sync_timeout_s`` raises and fences the engine
    (every later transfer raises); the processes of that channel, including the trainer sender,
    must be restarted. Channels to other replicas are separate communicators and complete.
+4. On NVSwitch nodes, M2N windows need NVLS multicast groups, which vLLM's own communicators also
+   take; with receivers inside vLLM workers the pool runs out (``ncclCommWindowRegister ... out of
+   memory``). Set ``NCCL_NVLS_ENABLE=0`` for the trainer and rollout processes there.
 """
 
 from __future__ import annotations
@@ -64,7 +72,7 @@ import time
 import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Iterator, Optional
 
 import ray
 import torch
@@ -85,8 +93,10 @@ except ImportError as e:  # pragma: no cover - depends on nccl-extensions
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-__all__ = ["NCCLM2NCheckpointEngine"]
+__all__ = ["NCCLM2NCheckpointEngine", "M2NReceiver", "WIRE_FORMAT"]
 
+# rollout workers that receive M2N transfers themselves advertise this in RolloutLayout.wire_formats
+WIRE_FORMAT = "nccl_m2n"
 # every bucket view starts on this byte alignment
 _ALIGN = 256
 
@@ -101,6 +111,10 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 def _digest(obj) -> str:
     return hashlib.sha256(pickle.dumps(obj)).hexdigest()[:16]
+
+
+def _align(n: int) -> int:
+    return (n + _ALIGN - 1) // _ALIGN * _ALIGN
 
 
 class _Server:
@@ -200,6 +214,210 @@ def _desc(item: PlanItem, side: Side, buf: Optional[torch.Tensor]) -> DistTensor
     return DistTensor(buf, local_shape=side.local_shape, dtype=_dtype(item.dtype), mesh=mesh, placements=placements)
 
 
+def _timeout(what: str, timeout_s: float) -> TimeoutError:
+    return TimeoutError(
+        f"nccl_m2n {what} did not complete in {timeout_s}s; an M2N transfer cannot be aborted in-process, "
+        "restart the trainer and rollout processes of this channel"
+    )
+
+
+async def _await_events(events, timeout_s: float, what: str) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not all(e.query() for e in events):
+        if time.monotonic() > deadline:
+            raise _timeout(what, timeout_s)
+        await asyncio.sleep(0.0005)
+
+
+def _block_events(events, timeout_s: float, what: str) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not all(e.query() for e in events):
+        if time.monotonic() > deadline:
+            raise _timeout(what, timeout_s)
+        time.sleep(0.0005)
+
+
+class _Endpoint:
+    """This process's M2N handle and channel communicators of one handle epoch."""
+
+    def __init__(self, bucket_size: int, group_bytes: int):
+        self.bucket_size = bucket_size
+        self.group_bytes = group_bytes
+        self.handle = None
+        self.channels: dict[Any, _Channel] = {}
+        self.opened = 0
+
+    def open(self, key, uid: bytes, size: int, rank: int, plan: list[PlanItem]) -> None:
+        if self.handle is None:
+            self.handle = Handle.create()
+        comm = Communicator.init(size, rank, UniqueId.from_bytes(uid))
+        buckets = split_buckets(plan, self.bucket_size, self.group_bytes)
+        self.channels[key] = _Channel(comm, torch.cuda.Stream(), buckets)
+        self.opened += 1
+
+    def close(self) -> None:
+        """Destroy the handle, then abort (local, no peer needed) every communicator of it."""
+        if self.handle is None and not self.channels:
+            return
+        torch.cuda.synchronize()
+        if self.handle is not None:
+            self.handle.destroy()
+            self.handle = None
+        for ch in self.channels.values():
+            ch.comm.abort()
+        self.channels = {}
+
+    def enqueue(self, ch: _Channel, group: list[PlanItem], bufs: dict, send: bool) -> None:
+        stream = int(ch.stream.cuda_stream)
+        with m2n.group() if len(group) > 1 else nullcontext():
+            for it in group:
+                if send:
+                    src, dst = _desc(it, it.src, bufs.get(it.name)), _desc(it, it.dst, None)
+                else:
+                    src, dst = _desc(it, it.src, None), _desc(it, it.dst, bufs[it.name])
+                self.handle.reshard(ch.comm, src, dst, stream=stream)
+
+
+# returns the tensor an item may be received into in place (contiguous, its local shape and dtype), or None
+DirectFn = Callable[[PlanItem], Optional[torch.Tensor]]
+
+
+class M2NReceiver:
+    """One rollout rank's end of its replica's channels (one per trainer stage).
+
+    ``sync`` applies the trainer's channel info of an update (opening the channels on a new
+    replica or generation); ``receive`` / ``areceive`` run the transfer in double-buffered units
+    and yield each unit's staged ``(name, tensor)`` list (views valid until the next unit). With
+    ``direct``, items that have an in-place destination are written there and not yielded.
+
+    Args:
+        keep_buffers: keep the two staging buffers between updates (else they are freed after each).
+    """
+
+    def __init__(self, bucket_size: int, group_bytes: int, timeout_s: float, keep_buffers: bool = True):
+        self.ep = _Endpoint(bucket_size, group_bytes)
+        self.timeout_s = timeout_s
+        self.keep_buffers = keep_buffers
+        self.gen: Optional[int] = None
+        self.uids: Optional[dict] = None
+        self.manifests: Optional[dict] = None
+        self.manifest_digest: Optional[str] = None
+        self.broken: Optional[str] = None
+        self.last_counts = {"direct": 0, "staged": 0, "bytes": 0}
+        self._bufs: list[torch.Tensor] = []
+
+    def take_manifests(self, rep: dict) -> None:
+        if "manifests" in rep:
+            self.manifests, self.manifest_digest = rep["manifests"], rep["manifest_digest"]
+
+    def sync(self, rep: dict, slices: list, replica_rank: int) -> None:
+        """Apply a ``("plan", ...)`` reply; ``slices``: every rank's ``RolloutLayout.slices`` in TP order."""
+        if self.broken is not None:
+            raise RuntimeError(f"nccl_m2n receiver is unusable after a failed transfer ({self.broken}); restart it")
+        self.take_manifests(rep)
+        if self.manifests is None or self.manifest_digest != rep["manifest_digest"]:
+            raise RuntimeError("nccl_m2n: this receiver does not have the trainer manifests of the update")
+        info = rep["channel"]
+        if rep["gen"] == self.gen and info["uids"] == self.uids:
+            return
+        # new replica, or the trainer started a new generation (possibly while this one was parked)
+        self.ep.close()
+        self.gen, self.uids = rep["gen"], None
+        for st, manifests in sorted(self.manifests.items()):
+            plan = build_channel_plan(manifests, slices)
+            digest, expected = plan_digest(plan), info["digests"][st]
+            if digest != expected:
+                raise RuntimeError(f"nccl_m2n: plan digest of stage {st} is {digest}, trainer has {expected}")
+            self.ep.open(st, info["uids"][st], info["sizes"][st], len(manifests) + replica_rank, plan)
+        self.uids = info["uids"]
+        logger.info(
+            "nccl_m2n gen %d: rollout rank %d opened %d channels", self.gen, replica_rank, len(self.ep.channels)
+        )
+
+    def _prepare(self, direct: Optional[DirectFn]) -> tuple[list, dict]:
+        units, chans = [], self.ep.channels
+        keys = sorted(chans)
+        for i in range(max(len(chans[k].buckets) for k in keys)):
+            units += [(k, chans[k].buckets[i]) for k in keys if i < len(chans[k].buckets)]
+        targets, need = {}, 0
+        for _k, bucket in units:
+            staged = 0
+            for group in bucket:
+                for it in group:
+                    t = direct(it) if direct is not None and it.dst.shard_dim is not None else None
+                    if t is not None:
+                        targets[it.name] = t
+                    else:
+                        staged += _align(it.dst_bytes)
+            need = max(need, min(staged, self.ep.bucket_size))
+        if not self._bufs or self._bufs[0].numel() < need:
+            self._bufs = [torch.empty(need, dtype=torch.uint8, device="cuda") for _ in range(2)]
+        self.last_counts = {"direct": len(targets), "staged": 0, "bytes": 0}
+        return units, targets
+
+    def _enqueue(self, units: list, j: int, targets: dict) -> tuple[dict, Any]:
+        k, bucket = units[j]
+        ch = self.ep.channels[k]
+        buf, staged, off = self._bufs[j % 2], {}, 0
+        for group in bucket:
+            for it in group:
+                if it.name in targets:
+                    continue
+                off = _align(off)
+                if off + it.dst_bytes > buf.numel():
+                    # larger than the buffer or pushed over it by alignment: give it its own tensor
+                    staged[it.name] = torch.empty(it.dst.local_shape, dtype=_dtype(it.dtype), device=buf.device)
+                    continue
+                staged[it.name] = buf[off : off + it.dst_bytes].view(_dtype(it.dtype)).view(it.dst.local_shape)
+                off += it.dst_bytes
+        ch.stream.wait_stream(torch.cuda.current_stream())
+        bufs = {**targets, **staged}
+        for group in bucket:
+            self.ep.enqueue(ch, group, bufs, send=False)
+        return staged, ch.stream.record_event()
+
+    def _account(self, staged: dict) -> list:
+        self.last_counts["staged"] += len(staged)
+        self.last_counts["bytes"] += sum(t.numel() * t.element_size() for t in staged.values())
+        return list(staged.items())
+
+    def _done(self) -> None:
+        torch.cuda.synchronize()
+        if not self.keep_buffers:
+            self._bufs = []
+
+    def receive(self, direct: Optional[DirectFn] = None) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        units, targets = self._prepare(direct)
+        try:
+            pending = self._enqueue(units, 0, targets) if units else None
+            for j in range(len(units)):
+                staged, event = pending
+                pending = self._enqueue(units, j + 1, targets) if j + 1 < len(units) else None
+                _block_events([event], self.timeout_s, "receive")
+                yield self._account(staged)
+                # the consumer may copy asynchronously; the buffer is refilled two units later
+                torch.cuda.synchronize()
+        except TimeoutError as e:
+            self.broken = f"receive: {e!r}"
+            raise
+        self._done()
+
+    async def areceive(self, direct: Optional[DirectFn] = None) -> AsyncGenerator[list[tuple[str, torch.Tensor]], None]:
+        units, targets = self._prepare(direct)
+        try:
+            pending = self._enqueue(units, 0, targets) if units else None
+            for j in range(len(units)):
+                staged, event = pending
+                pending = self._enqueue(units, j + 1, targets) if j + 1 < len(units) else None
+                await _await_events([event], self.timeout_s, "receive")
+                yield self._account(staged)
+                torch.cuda.synchronize()
+        except TimeoutError as e:
+            self.broken = f"receive: {e!r}"
+            raise
+        self._done()
+
+
 @CheckpointEngineRegistry.register("nccl_m2n")
 class NCCLM2NCheckpointEngine(CheckpointEngine):
     """NCCL M2N checkpoint engine.
@@ -235,6 +453,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
 
         self._is_rollout = False
         self._layout = None
+        self._direct = False
         self._server = _Server(self.sync_timeout_s) if is_master else None
         self._client: Optional[_Client] = None
         # set when a transfer missed its deadline: its streams may never complete
@@ -254,21 +473,25 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         self._manifest_digest: Optional[str] = None
         self._local_digest: Optional[str] = None
         self._gen = 0
-        self._known: dict[str, dict] = {}  # replica id -> {"idx", "uids", "digests", "sizes"}
+        self._known: dict[str, dict] = {}  # replica id -> {"idx", "uids", "digests", "sizes", "plan"}
         self._active: list[str] = []
+        self._ep = _Endpoint(bucket_size, self.group_bytes)
 
-        # both sides: this rank's channels of the current generation and its handle
-        self._handle = None
-        self._channels: dict[Any, _Channel] = {}  # trainer: replica id, rollout: stage
-        self._rollout_uids: Optional[dict] = None
-        self._recv_bufs: list[torch.Tensor] = []
-        self._opened = 0
+        # rollout
+        self._rx: Optional[M2NReceiver] = None
+        self._forwarded_digest: Optional[str] = None
+
+    @property
+    def wire_format(self) -> str:
+        return WIRE_FORMAT if self._direct else "named_tensors"
 
     # ------------------------------------------------------------------ topology
 
     def set_rollout_layout(self, layout) -> None:
         self._is_rollout = True
         self._layout = layout
+        self._direct = layout is not None and WIRE_FORMAT in (layout.wire_formats or [])
+        self._rx = M2NReceiver(self.bucket_size, self.group_bytes, self.sync_timeout_s)
 
     def prepare(self) -> dict:
         if self._is_rollout:
@@ -348,44 +571,23 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
     def finalize(self):
         """Keep communicators and buffers: they live as long as their replicas."""
 
-    def _check_usable(self) -> None:
-        if self._broken is not None:
-            raise RuntimeError(f"nccl_m2n engine is unusable after a failed transfer ({self._broken}); restart it")
-
-    def _close_local(self) -> None:
-        """Destroy the handle, then abort (local, no peer needed) every communicator of it."""
-        if self._handle is None and not self._channels:
-            return
-        torch.cuda.synchronize()
-        if self._handle is not None:
-            self._handle.destroy()
-            self._handle = None
-        for ch in self._channels.values():
-            ch.comm.abort()
-        self._channels = {}
-
-    def _open_channel(self, key, uid: bytes, size: int, rank: int, plan: list[PlanItem]) -> None:
-        if self._handle is None:
-            self._handle = Handle.create()
-        comm = Communicator.init(size, rank, UniqueId.from_bytes(uid))
-        buckets = split_buckets(plan, self.bucket_size, self.group_bytes)
-        self._channels[key] = _Channel(comm, torch.cuda.Stream(), buckets)
-        self._opened += 1
-
     def channel_state(self) -> dict:
         """Debug/test view: generation, open channels, communicators opened so far."""
-        return {"gen": self._gen, "channels": sorted(map(str, self._channels)), "opened": self._opened}
+        ep = self._rx.ep if self._rx is not None else self._ep
+        gen = self._rx.gen if self._rx is not None else self._gen
+        return {"gen": gen, "channels": sorted(map(str, ep.channels)), "opened": ep.opened}
 
     # ------------------------------------------------------------------ trainer
 
+    def _pieces(self, shards) -> list[Piece]:
+        return [
+            Piece(n, tuple(m.global_shape), _dtype_name(v.dtype), tuple(m.offset), tuple(m.local_shape))
+            for n, v, m in shards
+        ]
+
     def _gather_manifests(self, source, shards) -> None:
         stage, sender = getattr(source, "stage", 0), source.sender_index
-        pieces = []
-        if sender is not None:
-            pieces = [
-                Piece(n, tuple(m.global_shape), _dtype_name(v.dtype), tuple(m.offset), tuple(m.local_shape))
-                for n, v, m in shards
-            ]
+        pieces = self._pieces(shards) if sender is not None else []
         gathered: list = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, (stage, sender, pieces))
         by_stage: dict[int, dict[int, list]] = {}
@@ -402,13 +604,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         self._local_digest = _digest(pieces)
 
     def _check_manifest(self, shards) -> None:
-        if self._sender is None:
-            return
-        pieces = [
-            Piece(n, tuple(m.global_shape), _dtype_name(v.dtype), tuple(m.offset), tuple(m.local_shape))
-            for n, v, m in shards
-        ]
-        if _digest(pieces) != self._local_digest:
+        if self._sender is not None and _digest(self._pieces(shards)) != self._local_digest:
             raise RuntimeError("nccl_m2n: the trainer's local shard layout changed; restart the engine")
 
     def _sync_membership(self) -> dict:
@@ -460,12 +656,12 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
                 },
             )
         if stats["reset"]:
-            self._close_local()
+            self._ep.close()
         if self._sender is not None:
             # global (replica index) order on every rank, so overlapping inits cannot deadlock
             for rid in sorted(new, key=lambda r: self._known[r]["idx"]):
                 k = self._known[rid]
-                self._open_channel(rid, k["uids"][self._stage], k["sizes"][self._stage], self._sender, k["plan"])
+                self._ep.open(rid, k["uids"][self._stage], k["sizes"][self._stage], self._sender, k["plan"])
         self._active = active
         if new or stats["left"] or stats["rejoined"]:
             logger.info(
@@ -474,7 +670,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
                 self._stage,
                 self._sender,
                 len(active),
-                len(self._channels),
+                len(self._ep.channels),
                 stats,
             )
         return stats
@@ -482,7 +678,8 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
     @torch.no_grad()
     async def send_weights(self, engine, global_steps: int | None = None):
         """Send this rank's local HF shards of ``engine`` to every rollout replica of the update."""
-        self._check_usable()
+        if self._broken is not None:
+            raise RuntimeError(f"nccl_m2n engine is unusable after a failed transfer ({self._broken}); restart it")
         t0 = time.perf_counter()
         source = engine.get_hf_shard_source()
         shards = list(source.iter_shards())
@@ -498,7 +695,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
             "nccl_m2n/membership_s": t_plan - t_export,
             **{f"nccl_m2n/{k}": v for k, v in stats.items()},
         }
-        channels = [self._channels[rid] for rid in self._active if rid in self._channels]
+        channels = [self._ep.channels[rid] for rid in self._active if rid in self._ep.channels]
         if not channels:
             return metrics
 
@@ -508,7 +705,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
             ch.stream.wait_stream(cur)
         try:
             t_enq = await self._send_windowed(channels, local)
-            await self._wait([ch.stream.record_event() for ch in channels], "send")
+            await _await_events([ch.stream.record_event() for ch in channels], self.sync_timeout_s, "send")
         except BaseException as e:
             self._broken = f"send: {e!r}"
             raise
@@ -533,125 +730,54 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
                     waiting = True
                     continue
                 for group in ch.buckets[i]:
-                    self._enqueue(ch, group, local, send=True)
+                    self._ep.enqueue(ch, group, local, send=True)
                 events.append(ch.stream.record_event())
                 progressed = True
             if not progressed and not waiting:
                 return time.perf_counter()
             if not progressed:
                 if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"nccl_m2n send did not complete in {self.sync_timeout_s}s; an M2N transfer cannot be "
-                        "aborted in-process, restart the trainer and rollout processes of this channel"
-                    )
+                    raise _timeout("send", self.sync_timeout_s)
                 await asyncio.sleep(0.0002)
-
-    def _enqueue(self, ch: _Channel, group: list[PlanItem], bufs: dict, send: bool) -> None:
-        stream = int(ch.stream.cuda_stream)
-        with m2n.group() if len(group) > 1 else nullcontext():
-            for it in group:
-                if send:
-                    src, dst = _desc(it, it.src, bufs.get(it.name)), _desc(it, it.dst, None)
-                else:
-                    src, dst = _desc(it, it.src, None), _desc(it, it.dst, bufs[it.name])
-                self._handle.reshard(ch.comm, src, dst, stream=stream)
-
-    async def _wait(self, events, what: str) -> None:
-        deadline = time.monotonic() + self.sync_timeout_s
-        while not all(e.query() for e in events):
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"nccl_m2n {what} did not complete in {self.sync_timeout_s}s; an M2N transfer cannot be "
-                    "aborted in-process, restart the trainer and rollout processes of this channel"
-                )
-            await asyncio.sleep(0.0005)
 
     # ------------------------------------------------------------------ rollout
 
-    def _sync_rollout_channels(self) -> None:
-        rep = self._client.request(("plan", self._update, self._replica, self._manifest_digest))
-        if "manifests" in rep:
-            self._manifests, self._manifest_digest = rep["manifests"], rep["manifest_digest"]
-        info = rep["channel"]
-        if rep["gen"] == self._gen and info["uids"] == self._rollout_uids:
-            return
-        # new replica, or the trainer started a new generation (possibly while this one was parked)
-        self._close_local()
-        self._gen, self._rollout_uids = rep["gen"], None
-        for st, manifests in sorted(self._manifests.items()):
-            plan = build_channel_plan(manifests, self._slices)
-            digest = plan_digest(plan)
-            if digest != info["digests"][st]:
-                raise RuntimeError(
-                    f"nccl_m2n: plan digest of stage {st} is {digest}, trainer has {info['digests'][st]}"
-                )
-            self._open_channel(st, info["uids"][st], info["sizes"][st], len(manifests) + self._replica_rank, plan)
-        self._rollout_uids = info["uids"]
-        if not self._recv_bufs:
-            self._recv_bufs = [torch.empty(self.bucket_size, dtype=torch.uint8, device="cuda") for _ in range(2)]
-        logger.info(
-            "nccl_m2n gen %d: replica %s rank %s opened %d channels",
-            self._gen,
-            self._replica,
-            self._replica_rank,
-            len(self._channels),
-        )
-
-    def _carve(self, buf: torch.Tensor, bucket: list) -> dict[str, torch.Tensor]:
-        items = [it for group in bucket for it in group]
-        if len(items) == 1 and items[0].dst_bytes > buf.numel():
-            it = items[0]
-            return {it.name: torch.empty(it.dst.local_shape, dtype=_dtype(it.dtype), device=buf.device)}
-        views, off = {}, 0
-        for it in items:
-            off = (off + _ALIGN - 1) // _ALIGN * _ALIGN
-            if off + it.dst_bytes > buf.numel():
-                # alignment padding pushed the bucket over: give this item its own tensor
-                views[it.name] = torch.empty(it.dst.local_shape, dtype=_dtype(it.dtype), device=buf.device)
-                continue
-            views[it.name] = buf[off : off + it.dst_bytes].view(_dtype(it.dtype)).view(it.dst.local_shape)
-            off += it.dst_bytes
-        return views
-
     @torch.no_grad()
-    async def receive_weights(self, global_steps: int | None = None) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(self, global_steps: int | None = None) -> AsyncGenerator[tuple[str, Any], None]:
         """Yield ``(hf_name, tensor)``: this rank's box where the plan shards the tensor, else the
-        full tensor. Tensors are views into a reused bucket, valid until the next one is requested."""
-        self._check_usable()
+        full tensor; views into a reused bucket, valid until the next one is requested.
+
+        With the ``nccl_m2n`` wire format, yield one ``("nccl_m2n", update_info)`` instead: the
+        rollout's own workers receive (``M2NReceiver.sync`` with the unpickled ``update_info["reply"]``)."""
         t0 = time.perf_counter()
         # also waits until the trainer has entered this update's send
-        self._sync_rollout_channels()
+        rep = self._client.request(("plan", self._update, self._replica, self._rx.manifest_digest))
+        if self._direct:
+            self._rx.take_manifests(rep)
+            forward = dict(rep)
+            if self._forwarded_digest != rep["manifest_digest"]:
+                forward["manifests"] = self._rx.manifests
+            yield (
+                WIRE_FORMAT,
+                {
+                    # pickled: vLLM's collective_rpc serializes dataclasses (the manifests) as dicts
+                    "reply": pickle.dumps(forward),
+                    "bucket_size": self.bucket_size,
+                    "group_bytes": self.group_bytes,
+                    "timeout_s": self.sync_timeout_s,
+                },
+            )
+            self._forwarded_digest = rep["manifest_digest"]
+            return
 
-        units = []
-        keys = sorted(self._channels)
-        for i in range(max(len(self._channels[k].buckets) for k in keys)):
-            units += [(k, self._channels[k].buckets[i]) for k in keys if i < len(self._channels[k].buckets)]
-
-        def enqueue(j):
-            k, bucket = units[j]
-            ch = self._channels[k]
-            views = self._carve(self._recv_bufs[j % 2], bucket)
-            ch.stream.wait_stream(torch.cuda.current_stream())
-            for group in bucket:
-                self._enqueue(ch, group, views, send=False)
-            return views, ch.stream.record_event()
-
-        total = 0
-        try:
-            pending = enqueue(0)
-            for j in range(len(units)):
-                views, event = pending
-                pending = enqueue(j + 1) if j + 1 < len(units) else None
-                await self._wait([event], "receive")
-                for name, tensor in views.items():
-                    total += tensor.numel() * tensor.element_size()
-                    yield name, tensor
-                # the consumer may copy asynchronously; the buffer is refilled two units later
-                torch.cuda.synchronize()
-        except TimeoutError as e:
-            self._broken = f"receive: {e!r}"
-            raise
-        dt = time.perf_counter() - t0
+        self._rx.sync(rep, self._slices, self._replica_rank)
+        async for staged in self._rx.areceive():
+            for name, tensor in staged:
+                yield name, tensor
         logger.info(
-            "nccl_m2n receive: replica %s rank %s, %.2f GB in %.3fs", self._replica, self._replica_rank, total / 1e9, dt
+            "nccl_m2n receive: replica %s rank %s, %.2f GB in %.3fs",
+            self._replica,
+            self._replica_rank,
+            self._rx.last_counts["bytes"] / 1e9,
+            time.perf_counter() - t0,
         )

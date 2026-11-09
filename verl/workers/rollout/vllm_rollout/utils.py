@@ -17,6 +17,7 @@ import functools
 import json
 import logging
 import os
+import pickle
 import platform
 import signal
 import threading
@@ -444,6 +445,140 @@ class vLLMColocateWorkerExtension:
         worker_update_info = dict(update_info)
         worker_update_info["zmq_handle"] = self._get_zmq_handle()
         self.update_weights(worker_update_info)
+
+    def get_weight_ownership(self) -> dict:
+        """This worker's place in its replica as a ``RolloutLayout`` dict.
+
+        Where the worker can receive ``nccl_m2n`` transfers itself it lists that wire format, plus
+        the rank-local ``slices`` it keeps of each HF tensor (TP > 1, from ``rank_local_bake``).
+        """
+        from vllm.distributed import parallel_state as ps
+
+        pc = self.model_runner.vllm_config.parallel_config
+        out = {
+            "tp_size": int(pc.tensor_parallel_size),
+            "tp_rank": int(ps.get_tensor_model_parallel_rank()),
+            "pp_size": int(pc.pipeline_parallel_size),
+            "pp_rank": int(ps.get_pp_group().rank_in_group) if pc.pipeline_parallel_size > 1 else 0,
+        }
+        if self._m2n_receivable():
+            out["wire_formats"] = ["named_tensors", "nccl_m2n"]
+            plan = self._get_rank_local_plan()
+            if plan is not None and plan.slices:
+                out["slices"] = plan.slices
+        return out
+
+    def _m2n_receivable(self) -> bool:
+        """Plain bf16 weights on one pipeline stage: anything else needs the loader's conversions."""
+        try:
+            import nccl.m2n  # noqa: F401
+        except ImportError:
+            return False
+        cfg = self.model_runner.vllm_config
+        return (
+            cfg.parallel_config.pipeline_parallel_size == 1
+            and cfg.quant_config is None
+            and cfg.lora_config is None
+            and cfg.speculative_config is None
+            and cfg.model_config.dtype == torch.bfloat16
+        )
+
+    def _get_rank_local_plan(self):
+        """The rank-local plan, baked on the first call; ``None`` where boxes cannot be used.
+
+        Plain bf16 TP only: quantized weights are converted on load, LoRA syncs adapters, an MTP
+        drafter loads the same names again, and the bake does not handle PP. Under EP each resident
+        expert is loaded whole, so experts get no box.
+        """
+        if not hasattr(self, "_rank_local_plan"):
+            self._rank_local_plan = None
+            cfg = self.model_runner.vllm_config
+            pc = cfg.parallel_config
+            if (
+                pc.tensor_parallel_size > 1
+                and pc.pipeline_parallel_size == 1
+                and cfg.quant_config is None
+                and cfg.lora_config is None
+                and cfg.speculative_config is None
+                and os.path.isdir(cfg.model_config.model)  # hub ids are not resolved: full tensors
+            ):
+                from verl.workers.rollout.vllm_rollout import rank_local_bake
+
+                self._rank_local_plan = rank_local_bake.bake(self.model_runner.model, cfg.model_config.model)
+        return self._rank_local_plan
+
+    def _m2n_replica_slices(self) -> list:
+        """Every TP rank's ``slices`` in rank order (the destination side of the M2N plan), gathered once."""
+        if not hasattr(self, "_m2n_slices"):
+            from vllm.distributed import parallel_state as ps
+
+            plan = self._get_rank_local_plan()
+            mine = plan.slices if plan is not None and plan.slices else None
+            group = ps.get_tp_group()
+            out = [None] * group.world_size
+            torch.distributed.all_gather_object(out, mine, group=group.cpu_group)
+            self._m2n_slices = out
+        return self._m2n_slices
+
+    def update_weights_from_m2n(self, update_info: dict) -> dict:
+        """Receive one ``nccl_m2n`` update in this worker (``update_info`` from the checkpoint
+        engine's ``receive_weights``). Tensors whose rank-local box is one contiguous parameter
+        view are written there by M2N; the rest are received into staging buffers and loaded."""
+        import time
+
+        from vllm.distributed import parallel_state as ps
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import M2NReceiver
+        from verl.workers.rollout.vllm_rollout import rank_local_bake
+
+        t0 = time.perf_counter()
+        if self.device is None:
+            self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
+        rx = getattr(self, "_m2n_receiver", None)
+        if rx is None:
+            rx = M2NReceiver(
+                update_info["bucket_size"], update_info["group_bytes"], update_info["timeout_s"], keep_buffers=False
+            )
+            self._m2n_receiver = rx
+        model = self.model_runner.model
+        plan = self._get_rank_local_plan()
+        reply = pickle.loads(update_info["reply"])
+        rx.sync(reply, self._m2n_replica_slices(), int(ps.get_tensor_model_parallel_rank()))
+
+        for m in self._iter_all_models():
+            patch_vllm_moe_model_weight_loader(m)
+        staged_moe_layers = []
+        for m in self._iter_all_models():
+            staged_moe_layers.extend(stage_unquantized_moe_params(m))
+        direct = None
+        if plan is not None and not staged_moe_layers:
+            params = dict(model.named_parameters())
+
+            def direct(it):
+                sc = plan.scatters.get(it.name)
+                if sc is None or sc.shape != it.dst.local_shape:
+                    return None
+                p = params[sc.param]
+                if str(p.dtype) != f"torch.{it.dtype}":
+                    return None
+                view = p.data.as_strided(sc.shape, sc.stride, p.storage_offset() + sc.offset)
+                return view if view.is_contiguous() else None
+
+        for staged in rx.receive(direct):
+            rest = rank_local_bake.apply(model, plan, staged) if plan is not None else staged
+            if rest:
+                self._update_weights(rest, peft_config=None, base_sync_done=False)
+        with fold_unquantized_moe_params(staged_moe_layers):
+            for m, model_config in self._iter_all_models_with_config():
+                process_weights_after_loading(m, model_config, self.device)
+        counts = rx.last_counts
+        return {
+            "direct": counts["direct"],
+            "loaded": counts["staged"],
+            "staged_gb": counts["bytes"] / 1e9,
+            "receive_s": time.perf_counter() - t0,
+        }
 
 
 class SuppressSignalInThread:

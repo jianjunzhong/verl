@@ -1625,6 +1625,10 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            if self.config.checkpoint_engine.backend == "nccl_m2n":
+                # the workers join M2N communicators with the trainers: NCCL's cuMem setting must match
+                # theirs (the default), and M2N windows need cuMem buffers
+                env_vars["NCCL_CUMEM_ENABLE"] = os.environ.get("NCCL_CUMEM_ENABLE", "1")
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

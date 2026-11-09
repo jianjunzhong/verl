@@ -207,14 +207,32 @@ class ServerAdapter(BaseRollout):
             await self.server_handle.sleep.remote()
 
     async def get_weight_ownership(self):
-        """This worker's place in its replica as a ``RolloutLayout``, without ``slices``: every
-        tensor is delivered full. Only plain TP replicas are described; anything else is ``None``."""
+        """This worker's ``RolloutLayout``, reported by its vLLM worker. Only single-node plain TP
+        replicas are described; anything else is ``None``.
+
+        Every rollout worker needs its own layout, not only the one holding the server handle, so
+        each asks the replica's server and picks its entry from the per-worker ``collective_rpc``
+        results, which are ordered by rank within the replica.
+        """
         from verl.workers.rollout.base import RolloutLayout
 
         cfg = self.config
         if self._pd_role is not None or cfg.data_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
             return None
-        return RolloutLayout(tp_size=cfg.tensor_model_parallel_size, tp_rank=self.rollout_rank)
+        if self.server_handle is None:
+            try:
+                handle = ray.get_actor(f"{self._get_server_name_prefix()}server_{self.replica_rank}_0")
+            except ValueError:
+                logger.warning(f"get_weight_ownership: no server for replica {self.replica_rank}")
+                return None
+        else:
+            handle = self.server_handle
+        results = await handle.collective_rpc.remote("get_weight_ownership")
+        if not results or len(results) != cfg.tensor_model_parallel_size:
+            # a multi-node replica: the other nodes' workers are not reachable through this server
+            logger.warning(f"get_weight_ownership: {len(results or [])} vLLM workers on the replica's server")
+            return None
+        return RolloutLayout.from_dict(results[self.rollout_rank])
 
     @torch.no_grad()
     async def update_weights(
@@ -231,8 +249,10 @@ class ServerAdapter(BaseRollout):
         """
         if wire_format == "delta_flush":
             return await self._update_delta_weights(weights, global_steps=global_steps)
+        if wire_format == "nccl_m2n":
+            return await self._update_m2n_weights(weights, global_steps=global_steps)
         assert wire_format == "named_tensors", (
-            f"vLLM rollout supports wire_format='named_tensors' or 'delta_flush'; got {wire_format!r}"
+            f"vLLM rollout supports wire_format='named_tensors', 'delta_flush' or 'nccl_m2n'; got {wire_format!r}"
         )
         start_time = time.time()
 
@@ -261,6 +281,18 @@ class ServerAdapter(BaseRollout):
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+
+    async def _update_m2n_weights(self, weights, *, global_steps: int | None) -> None:
+        """Forward the ``nccl_m2n`` channel info to every vLLM worker, which receive themselves."""
+        start_time, results = time.time(), None
+        async for _name, update_info in weights:
+            results = await self._execute_method("update_weights_from_m2n", kwargs={"update_info": update_info})
+        if self._has_server:
+            await self.server_handle.clear_kv_cache.remote()
+            if global_steps is not None:
+                await self.server_handle.set_global_steps.remote(global_steps)
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            logger.info(f"update_weights (nccl_m2n) done in {time.time() - start_time:.2f}s: {results}")
 
     async def _update_delta_weights(
         self,

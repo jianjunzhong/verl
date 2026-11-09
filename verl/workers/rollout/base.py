@@ -37,7 +37,8 @@ class RolloutLayout:
     * ``layer_range``: ``(start, end)`` decoder layers of this pipeline stage (``None`` = all).
     * ``local_experts``: ``{layer_idx: [global expert ids]}`` routed experts on this worker.
     * ``wire_formats``: what ``receive_weights`` accepts: ``named_tensors`` (full HF tensors) and
-      optionally ``rank_local_named_tensors`` (each tensor arrives as its ``slices`` box).
+      optionally ``rank_local_named_tensors`` (each tensor arrives as its ``slices`` box) or
+      ``nccl_m2n`` (the inference workers join the ``nccl_m2n`` transfer themselves).
     * ``slices``: ``{hf_name: {"full_shape": [...], "box": [[start, len], ...]}}``; names not
       listed arrive full.
     * ``slice_digest``: hash of ``slices`` (empty = computed by the engine).
@@ -108,11 +109,12 @@ class BaseRollout(ABC):
 
         Args:
             weights: A generator yielding ``(name, tensor)`` pairs for
-                ``named_tensors``, or ``(named_tensors, is_last)`` flushes for
-                ``delta_flush``.
-            wire_format: ``named_tensors`` for full tensors (the default), or
-                ``delta_flush`` for delta-engine flushes. Adapters must branch on
-                this value instead of treating a delta flush as named weights.
+                ``named_tensors``, ``(named_tensors, is_last)`` flushes for
+                ``delta_flush``, or one ``("nccl_m2n", update_info)`` for ``nccl_m2n``.
+            wire_format: ``named_tensors`` for full tensors (the default),
+                ``delta_flush`` for delta-engine flushes, or ``nccl_m2n`` when the
+                workers receive an ``nccl_m2n`` transfer themselves. Adapters must
+                branch on this value instead of treating the payload as named weights.
         """
         pass
 
