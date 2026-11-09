@@ -546,7 +546,9 @@ class CheckpointEngineManager:
         )
 
     def add_replicas(self, replicas: list[RolloutReplica]):
-        """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
+        """Add rollout replicas to the manager for elastic scale up. They receive weights from the next
+        ``update_weights``, whose ``build_process_group`` lets the backend rebuild its groups (most
+        backends) or only connect the new replicas (``nccl_m2n``).
 
         Args:
             replicas: The list of rollout replicas to add.
@@ -554,7 +556,9 @@ class CheckpointEngineManager:
         self.replicas.extend(replicas)
 
     def remove_replicas(self, replicas: list[RolloutReplica]):
-        """Remove rollout replicas from the manager for elastic scale down, will rebuild process group.
+        """Remove rollout replicas from the manager for elastic scale down. The next ``update_weights``
+        leaves them out; the backend rebuilds its groups (most backends) or skips them (``nccl_m2n``
+        parks their communicators so they can rejoin).
 
         Args:
             replicas: The list of rollout replicas to remove.

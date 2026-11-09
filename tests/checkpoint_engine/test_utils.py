@@ -92,6 +92,7 @@ class MockServerAdapter(BaseRollout):
         self.model = None
         self.received_weights: dict[str, torch.Tensor] = {}
         self.slices: dict = {}
+        self.kill_after: int | None = None
 
     async def get_weight_ownership(self):
         from verl.workers.rollout.base import RolloutLayout
@@ -118,7 +119,11 @@ class MockServerAdapter(BaseRollout):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         **kwargs,
     ):
+        received = 0
         async for name, weight in weights:
+            received += 1
+            if self.kill_after is not None and received > self.kill_after:
+                os._exit(1)  # simulate a rollout crash in the middle of a transfer
             weight = weight.clone()
             if self.check_allclose:
                 self.received_weights[name] = weight.clone()
@@ -183,6 +188,10 @@ class CheckpointEngineWorkerTest(CheckpointEngineWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def check_weights(self):
         return self.server_adapter.check_weights()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_kill_after(self, num_tensors: int | None):
+        self.server_adapter.kill_after = num_tensors
 
 
 def create_trainer_worker_group(

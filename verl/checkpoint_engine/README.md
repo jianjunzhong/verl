@@ -20,7 +20,7 @@ Checkpoint Engine is an unified abstract layer to synchronize weights between va
 |nixl|NIXL|all_gather+ring p2p|Various transport backends (D2D, H2H, H2D, etc)<br>- UCX<br>- UCCL<br>- Mooncacke|Medium/High|High: dynamic adjust ring topology|Off-policy training<br>- Actor/rollout disaggregated<br>- Elastic rollout<br>- Rollout fault tolerance<br>- Heterogeneous hardware rollout
 |kimi_ckpt_engine|MOONCAKE+NCCL/HCCL|p2p+broadcast|NVIDIA/Ascend|High|Low: rebuild communication group|Off-policy training<br>- Actor/rollout disaggregated<br>- Save checkpoint each time
 |mooncake|Mooncake Transfer Engine|all_gather+ring p2p|NVIDIA/Ascend|High|High: dynamic adjust ring topology|Off-policy training<br>- Actor/rollout disaggregated<br>- Fixed clusters
-|nccl_m2n|NCCL M2N (nccl-extensions)|local shard p2p reshard (no all_gather)|NVIDIA GPU & NCCL|Very High|Medium: one communicator per rollout replica|Off-policy training<br>- Actor/rollout disaggregated<br>- Each rollout rank receives only its TP shard
+|nccl_m2n|NCCL M2N (nccl-extensions)|local shard p2p reshard (no all_gather)|NVIDIA GPU & NCCL|Very High|Medium: per-replica communicators, join/leave without touching other replicas; a dead peer mid-transfer needs a restart|Off-policy training<br>- Actor/rollout disaggregated<br>- Elastic rollout<br>- Each rollout rank receives only its TP shard
 
 ##### kimi_ckpt_engine detail:
 
