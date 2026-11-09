@@ -175,7 +175,9 @@ class BaseEngine:
         :mod:`verl.workers.engine.hf_shard`) for every HF tensor piece this rank sends, without
         gathering, plus ``sender_index`` (this rank's index among the senders of its pipeline stage,
         ``None`` if it sends nothing) and ``stage``. ``stack_experts``: emit MoE experts stacked per
-        layer where the layout allows (see :mod:`verl.checkpoint_engine.nccl_m2n_plan`).
+        layer where the layout allows (see :mod:`verl.checkpoint_engine.nccl_m2n_plan`). With a
+        rollout weight quantizer set, the pieces are the quantized tensors (see
+        :mod:`verl.workers.engine.hf_shard_quant`).
         """
         raise NotImplementedError(f"{type(self).__name__} does not export local HF shards")
 

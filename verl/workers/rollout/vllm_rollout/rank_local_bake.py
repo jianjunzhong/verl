@@ -237,12 +237,12 @@ def stacked_scatter(plan: RankLocalPlan, name: str, local_shape: tuple[int, ...]
     sk = stacked_kind(name)
     if sk is None or len(local_shape) != 3:
         return None
-    prefix, kind = sk
+    prefix, kind, key = sk
     per = 2 if kind == "gate_up_proj" else 1
-    e0 = _first_experts(plan).get((prefix, kind, "weight"))
+    e0 = _first_experts(plan).get((prefix, kind, key))
     if e0 is None:
         return None
-    rows = [n for e in range(e0, e0 + local_shape[0] // per) for n in expert_names(prefix, kind, e)]
+    rows = [n for e in range(e0, e0 + local_shape[0] // per) for n in expert_names(prefix, kind, e, key)]
     scs = [plan.scatters.get(n) for n in rows]
     row_shape = tuple(local_shape[1:])
     row_stride = (row_shape[1], 1)

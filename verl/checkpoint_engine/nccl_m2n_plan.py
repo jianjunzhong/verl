@@ -37,7 +37,8 @@ MoE experts may travel stacked per layer under the transformers-v5 names (one ca
 of one per expert): ``<layer>.mlp.experts.gate_up_proj`` described as ``[2E, I, H]`` (row ``2e`` is
 expert ``e``'s ``gate_proj``, ``2e + 1`` its ``up_proj``) and ``<layer>.mlp.experts.down_proj`` as
 ``[E, H, I]``. Their destination boxes are derived from the per-expert ``slices``, and receivers
-turn them back into per-expert views with :func:`unstack`.
+turn them back into per-expert views with :func:`unstack`. Quantized experts append the output key
+(``<layer>.mlp.experts.gate_up_proj.weight_scale``: rows of ``<layer>.mlp.experts.<e>.<proj>.weight_scale``).
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ __all__ = [
     "MAX_TENSOR_DIMS",
 ]
 
-_STACKED = re.compile(r"^(?P<prefix>.+)\.mlp\.experts\.(?P<kind>gate_up_proj|down_proj)$")
+_STACKED = re.compile(r"^(?P<prefix>.+)\.mlp\.experts\.(?P<kind>gate_up_proj|down_proj)(?:\.(?P<key>\w+))?$")
 
 MAX_TENSOR_DIMS = 3
 # M2N v0.2: at most 16 source ranks feed one destination shard
@@ -239,17 +240,18 @@ def _dst_placement(
     return (1, None) if sd is None or sd < 0 else (n // period, sd)
 
 
-def stacked_kind(name: str) -> Optional[tuple[str, str]]:
-    """``(layer prefix, "gate_up_proj" | "down_proj")`` for a stacked expert name, else ``None``."""
+def stacked_kind(name: str) -> Optional[tuple[str, str, str]]:
+    """``(layer prefix, "gate_up_proj" | "down_proj", key)`` for a stacked expert name (``key``:
+    ``"weight"``, or a quantized output such as ``"weight_scale"``), else ``None``."""
     m = _STACKED.match(name)
-    return (m["prefix"], m["kind"]) if m else None
+    return (m["prefix"], m["kind"], m["key"] or "weight") if m else None
 
 
-def expert_names(prefix: str, kind: str, e: int) -> list[str]:
+def expert_names(prefix: str, kind: str, e: int, key: str = "weight") -> list[str]:
     base = f"{prefix}.mlp.experts.{e}."
     if kind == "gate_up_proj":
-        return [base + "gate_proj.weight", base + "up_proj.weight"]
-    return [base + "down_proj.weight"]
+        return [f"{base}gate_proj.{key}", f"{base}up_proj.{key}"]
+    return [f"{base}down_proj.{key}"]
 
 
 def _stacked_entry(name: str, shape: tuple[int, ...], slices: dict) -> Optional[dict]:
@@ -260,11 +262,11 @@ def _stacked_entry(name: str, shape: tuple[int, ...], slices: dict) -> Optional[
     sk = stacked_kind(name)
     if sk is None or len(shape) != 3:
         return None
-    prefix, kind = sk
+    prefix, kind, key = sk
     n_rows = 2 if kind == "gate_up_proj" else 1
     box, experts = None, []
     for e in range(shape[0] // n_rows):
-        entries = [slices.get(n) for n in expert_names(prefix, kind, e)]
+        entries = [slices.get(n) for n in expert_names(prefix, kind, e, key)]
         if all(entry is None for entry in entries):
             continue
         for entry in entries:
@@ -286,15 +288,15 @@ def unstack(item: PlanItem, tensor, rank: int) -> list[tuple[str, object]]:
     """Per-expert views of a received stacked expert tensor (``rank``: this receiver's index on the
     destination side). Other items come back as ``[(name, tensor)]``."""
     sk = stacked_kind(item.name)
-    if sk is None or len(item.global_shape) != 3:
+    if sk is None or len(item.global_shape) < 2:
         return [(item.name, tensor)]
-    prefix, kind = sk
+    prefix, kind, key = sk
     n_rows = 2 if kind == "gate_up_proj" else 1
     first = (rank % item.dst.shard_n) * item.dst.local_shape[0] if item.dst.shard_dim == 0 else 0
     out = []
     for row in range(tensor.shape[0]):
         e, part = divmod(first + row, n_rows)
-        out.append((expert_names(prefix, kind, e)[part], tensor[row]))
+        out.append((expert_names(prefix, kind, e, key)[part], tensor[row]))
     return out
 
 

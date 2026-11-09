@@ -34,6 +34,10 @@ Senders: the ranks of a pipeline stage that ship anything (dp/cp and expert-dp
 replicas are deduplicated by the export index), numbered in global rank order.
 Megatron keeps TP (and ETP) ranks adjacent, so the holders of every HF tensor
 are a contiguous run of senders, as M2N source meshes need.
+
+With a rollout weight quantizer the pieces are quantized locally
+(:mod:`..hf_shard_quant`); a tensor whose box cuts a quantization block on
+some rank takes the gather fallback and is quantized whole.
 """
 
 from __future__ import annotations
@@ -61,6 +65,8 @@ class _Row:
     # per HF slot: (meta, count) for box slots; None when this row falls back
     metas: Optional[list] = None
     fallback: bool = False
+    # this rank's piece cuts quantization blocks (rollout quantization only)
+    cuts_blocks: bool = False
 
 
 def _stacked_meta(key, n_e, e0, n, off, size, shape) -> HFShardMeta:
@@ -103,12 +109,16 @@ class MegatronHFShardSource:
             kind (:mod:`verl.checkpoint_engine.nccl_m2n_plan`), copied into a persistent buffer every
             step, wherever the stacked box is cut on at most one dim on every rank (so not with
             EP > 1 and ETP > 1 together). One expert-dp replica ships each stack.
+        quantizer: the engine's rollout weight quantizer, applied to the local pieces.
     """
 
-    def __init__(self, engine, force_fallback: Optional[set[str]] = None, stack_experts: bool = False):
+    def __init__(self, engine, force_fallback: Optional[set[str]] = None, stack_experts: bool = False, quantizer=None):
+        from ..hf_shard_quant import LocalShardQuantizer
+
         self.engine = engine
         self.force_fallback = set(force_fallback or ())
         self.stack_experts = stack_experts
+        self.quant = LocalShardQuantizer(quantizer) if quantizer is not None else None
         self._rows: Optional[list[_Row]] = None
         self._stacks: list[_Stack] = []
         self._stacked_rows: set[int] = set()
@@ -161,6 +171,8 @@ class MegatronHFShardSource:
                     off += c
                     if c and (box is None or name in self.force_fallback):
                         good = False
+                    elif c and self.quant is not None and not self.quant.aligned(name, tuple(shape), *box):
+                        good, row.cuts_blocks = False, True
                     meta = None if not c else HFShardMeta(name, tuple(shape), lval.dtype, *box) if box else None
                     row.metas.append((meta, c))
                 # warm the cached source runs used by iter_shards
@@ -173,10 +185,11 @@ class MegatronHFShardSource:
         flags = torch.tensor(ok, dtype=torch.int32, device=torch.cuda.current_device())
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(flags, op=dist.ReduceOp.MIN)
-        for row, flag in zip(rows, flags.tolist(), strict=True):
+        for row, flag, good in zip(rows, flags.tolist(), ok, strict=True):
             row.fallback = not flag
-            if row.fallback:
-                logger.warning("%s: HF output is not a dense box, exported via gather", row.rec.megatron_name)
+            if not good:  # logged by the ranks that cause the fallback
+                why = "its box cuts quantization blocks" if row.cuts_blocks else "HF output is not a dense box"
+                logger.warning("%s: %s, exported via gather", row.rec.megatron_name, why)
         self._rows = rows
         if self.stack_experts:
             self._plan_stacks(rows)
@@ -278,6 +291,12 @@ class MegatronHFShardSource:
         order identical on every rank of a pipeline stage. Gather fallbacks are collective."""
         if self._rows is None:
             self.plan()
+        if self.quant is None:
+            yield from self._iter_bf16()
+        else:
+            yield from self.quant(list(self._iter_bf16()))
+
+    def _iter_bf16(self) -> Iterator[tuple[str, torch.Tensor, HFShardMeta]]:
         fills: dict[int, list] = {}
         for stack in self._stacks:
             for i, voff, c, brow in stack.parts:

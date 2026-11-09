@@ -1114,7 +1114,8 @@ class MegatronEngine(BaseEngine):
 
     def get_hf_shard_source(self, stack_experts: bool = False):
         """The cached :class:`~.hf_shard_source.MegatronHFShardSource` of this engine: local
-        HF shards with their boxes, for point-to-point checkpoint engines."""
+        HF shards with their boxes, for point-to-point checkpoint engines, quantized for the
+        rollout if :meth:`set_rollout_weight_quantizer` was called first."""
         sources = self.__dict__.setdefault("_hf_shard_sources", {})
         source = sources.get(stack_experts)
         if source is None or self.is_param_offload_enabled:
@@ -1124,7 +1125,9 @@ class MegatronEngine(BaseEngine):
             from .hf_shard_source import MegatronHFShardSource
 
             self._mcore_export_index()
-            source = sources[stack_experts] = MegatronHFShardSource(self, stack_experts=stack_experts)
+            source = sources[stack_experts] = MegatronHFShardSource(
+                self, stack_experts=stack_experts, quantizer=self._rollout_weight_quantizer
+            )
         return source
 
     def get_per_tensor_param_delta_shard(self, **kwargs):

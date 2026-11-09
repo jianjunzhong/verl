@@ -30,6 +30,7 @@ from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
 from verl.utils.device import get_torch_device
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
+from verl.workers.config.rollout import RolloutQuantizationConfig
 
 _ngpus = get_torch_device().device_count()
 pytest.importorskip("nccl.m2n")
@@ -70,7 +71,14 @@ def _tiny_moe(tied: bool = False) -> str:
 
 
 async def _setup(
-    num_trainer, rollout_tp, engine_kwargs, shard_dst, bucket_size_mb=512, model_path=None, engine_config=None
+    num_trainer,
+    rollout_tp,
+    engine_kwargs,
+    shard_dst,
+    bucket_size_mb=512,
+    model_path=None,
+    engine_config=None,
+    quantization=None,
 ):
     ray.init(runtime_env={"env_vars": {"VERL_LOGGING_LEVEL": "INFO"}})
     checkpoint_engine_config = CheckpointEngineConfig(
@@ -82,7 +90,10 @@ async def _setup(
         path=model_path or _model_path(), tokenizer_path=_model_path(), use_remove_padding=True
     )
     rollout_config = RolloutConfig(
-        name="vllm", tensor_model_parallel_size=rollout_tp, checkpoint_engine=checkpoint_engine_config
+        name="vllm",
+        tensor_model_parallel_size=rollout_tp,
+        checkpoint_engine=checkpoint_engine_config,
+        quantization=RolloutQuantizationConfig(**(quantization or {})),
     )
     resource_pool = RayResourcePool(process_on_nodes=[_ngpus], max_colocate_count=3)
     trainer_pool, rollout_pool = split_resource_pool(resource_pool, [num_trainer, _ngpus - num_trainer])
@@ -90,6 +101,8 @@ async def _setup(
         trainer_pool, model_config, checkpoint_engine_config, strategy="fsdp2", engine_config=engine_config
     )
     actor_wg.reset()
+    if quantization:
+        actor_wg.set_rollout_quantization(rollout_config)
     rollout, replicas = await create_rollout_worker_group(
         rollout_pool, model_config, rollout_config, check_allclose=True, shard_dst=shard_dst
     )
@@ -172,6 +185,40 @@ async def test_nccl_m2n_megatron(tp, pp, ep, etp, moe, stack, items, num_trainer
             assert metrics["nccl_m2n/items"] == items, metrics
         # one channel per (stage, replica) on every sender
         assert metrics["nccl_m2n/opened"] == (len(replicas) if step == 0 else 0), metrics
+    ray.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linear, moe", [("FP8_BLOCK", "FP8_BLOCK"), ("MXFP8", "MXFP4")])
+@auto_await
+async def test_nccl_m2n_megatron_quantized(linear, moe, num_trainer=4, rollout_tp=2):
+    """Trainer-side ``(weight, scale)`` from Megatron TP2 EP2 local shards (experts stacked), bitwise
+    equal to quantizing the checkpoint. FP8_BLOCK: the 64-row k/v TP pieces cut 128-row blocks, so
+    those tensors take the gather fallback."""
+    from verl.workers.config import McoreEngineConfig
+
+    engine_config = McoreEngineConfig(
+        forward_only=True,
+        use_mbridge=True,
+        tensor_model_parallel_size=2,
+        expert_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+    )
+    config, actor_wg, rollout, replicas = await _setup(
+        num_trainer,
+        rollout_tp,
+        {},
+        shard_dst=False,
+        bucket_size_mb=64,
+        model_path=_tiny_moe(),
+        engine_config=engine_config,
+        quantization={"linear": linear, "moe": moe},
+    )
+    manager = CheckpointEngineManager(config=config, actor_wg=actor_wg, replicas=replicas)
+    for step in range(3):
+        metrics = await manager.update_weights(global_steps=step)
+        print(f"step {step}: {metrics}")
+        rollout.check_weights()
     ray.shutdown()
 
 

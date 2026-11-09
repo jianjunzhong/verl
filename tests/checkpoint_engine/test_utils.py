@@ -51,6 +51,16 @@ class TrainingWorkerTest(TrainingWorker):
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_rollout_quantization(self, rollout_config: RolloutConfig):
+        """What the actor worker does for ``rollout.quantization``."""
+        from verl.utils.qat import dispatch_rollout_weight_quantizer
+
+        quantizer = dispatch_rollout_weight_quantizer(
+            model_config=self.config.model_config, rollout_config=rollout_config
+        )
+        self.engine.set_rollout_weight_quantizer(quantizer)
+
 
 def mock_tp_slices(model_path: str, tp_size: int, tp_rank: int) -> dict:
     """vLLM-like TP boxes of a dense HF decoder: column-parallel weights split rows, row-parallel ones
@@ -141,6 +151,14 @@ class MockServerAdapter(BaseRollout):
             if self.model_config.hf_config.tie_word_embeddings and "lm_head.weight" not in self.received_weights:
                 # Megatron has no output layer to ship for tied embeddings; the rollout ties it itself
                 self.reference.pop("lm_head.weight", None)
+            if self.config.quantization.enabled:
+                from verl.utils.qat import dispatch_rollout_weight_quantizer
+
+                quantizer = dispatch_rollout_weight_quantizer(
+                    model_config=self.model_config, rollout_config=self.config
+                )
+                quantized = quantizer((n, t.cuda()) for n, t in self.reference.items())
+                self.reference = {n: t.cpu() for n, t in quantized}
 
         boxes = 0
         for name, weight in self.reference.items():
@@ -150,9 +168,15 @@ class MockServerAdapter(BaseRollout):
                 entry = self.slices[name]
                 weight = weight[tuple(slice(s, s + n) for s, n in entry["box"])]
                 boxes += 1
-            assert torch.allclose(weight.to(received.device, dtype=received.dtype), received), (
-                f"weight {name} not equal"
-            )
+            weight = weight.to(received.device).contiguous()
+            if weight.element_size() == 1 or received.dtype != torch.bfloat16:
+                # quantized: bitwise
+                assert weight.dtype == received.dtype, f"weight {name}: {weight.dtype} vs {received.dtype}"
+                assert torch.equal(weight.view(torch.uint8), received.contiguous().view(torch.uint8)), (
+                    f"weight {name} not equal"
+                )
+            else:
+                assert torch.allclose(weight.to(received.dtype), received), f"weight {name} not equal"
         self.received_weights.clear()
         print(f"Check passed, all weights are equal ({boxes} received as rank-local boxes)!")
         return boxes
