@@ -108,8 +108,42 @@ def read_manifest(model_path: str) -> dict[str, list[int]]:
     return manifest
 
 
+def _dry_run(model: torch.nn.Module, entries: list, device) -> tuple[dict, int, Exception | None, bool]:
+    """One ``model.load_weights`` call over ``entries`` (``[(name, full_shape), ...]``) as fakes.
+
+    Returns the copies caught per name read, the index of the last entry read (``-1``: none), the
+    exception the loader raised (``None`` if it finished) and whether a copy arrived for an entry
+    other than the last one read (a loader that reads ahead: the index then need not be the culprit).
+    """
+    copies, at, ahead = {}, [-1], [False]
+
+    def sink(i, caught):
+        def put(c):
+            ahead[0] |= i != at[0]
+            caught.append(c)
+
+        return put
+
+    def stream():
+        for i, (name, shape) in enumerate(entries):
+            at[0] = i
+            yield name, _BoxFake([(0, n) for n in shape], device, sink(i, copies.setdefault(name, [])))
+
+    try:
+        with torch.no_grad():
+            model.load_weights(stream())
+    except Exception as e:
+        return copies, at[0], e, ahead[0]
+    return copies, at[0], None, ahead[0]
+
+
 def bake(model: torch.nn.Module, model_path: str) -> RankLocalPlan:
-    """Dry-run ``model.load_weights`` once per checkpoint name; see the module docstring.
+    """Dry-run ``model.load_weights`` over the checkpoint names; see the module docstring.
+
+    All names go through one call, since every call rebuilds the model's name -> parameter tables
+    (``O(#modules)`` per call: one call per name took 28 s on Qwen3-30B-A3B). A name the loader
+    raises on is dropped and the call resumes after it; when the failing name cannot be told (the
+    loader reads ahead), the names of that call are retried one call each.
 
     Runs on the real parameters: a loader may still write before it reaches the weight (e.g. zeroing
     the vocab padding rows), which is harmless because the trainer sends every weight right after.
@@ -117,17 +151,31 @@ def bake(model: torch.nn.Module, model_path: str) -> RankLocalPlan:
     device = next(model.parameters()).device
     owners = {p.untyped_storage().data_ptr(): (n, p) for n, p in model.named_parameters()}
     plan, errors = RankLocalPlan(), {}
-    for name, shape in read_manifest(model_path).items():
-        copies = []
-        try:
-            with torch.no_grad():
-                model.load_weights([(name, _BoxFake([(0, n) for n in shape], device, copies.append))])
-        except Exception as e:  # any loader we cannot follow keeps the full tensor
-            errors[name] = f"{type(e).__name__}: {e}"
+    manifest = read_manifest(model_path)
+    entries, copies = list(manifest.items()), {}
+    while entries:
+        got, at, err, ahead = _dry_run(model, entries, device)
+        if err is None:
+            copies.update(got)
+            break
+        if at < 0 or ahead:
+            for entry in entries:
+                got, _, err, _ = _dry_run(model, [entry], device)
+                if err is None:
+                    copies.update(got)
+                else:
+                    errors[entry[0]] = f"{type(err).__name__}: {err}"
+            break
+        # any loader we cannot follow keeps the full tensor
+        errors[entries[at][0]] = f"{type(err).__name__}: {err}"
+        got.pop(entries[at][0], None)
+        copies.update(got)
+        entries = entries[at + 1 :]
+    for name, shape in manifest.items():
+        caught = copies.get(name, [])
+        if len(caught) != 1:  # 0: skipped by the model (e.g. tied lm_head); >1: several destinations
             continue
-        if len(copies) != 1:  # 0: skipped by the model (e.g. tied lm_head); >1: several destinations
-            continue
-        box, dest = copies[0]
+        box, dest = caught[0]
         lens = tuple(n for _, n in box)
         owner = owners.get(dest.untyped_storage().data_ptr())
         # the trainer's box planner cuts at most 2-D tensors (e.g. not stacked 3-D experts)
