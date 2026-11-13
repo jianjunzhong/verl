@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -33,6 +34,8 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
+import zmq
+import zmq.asyncio
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
@@ -44,6 +47,9 @@ from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedW
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# covers the first call's rank-local bake on the vLLM side
+_LAYOUT_TIMEOUT_S = 600.0
 
 
 class ServerAdapter(BaseRollout):
@@ -207,32 +213,51 @@ class ServerAdapter(BaseRollout):
             await self.server_handle.sleep.remote()
 
     async def get_weight_ownership(self):
-        """This worker's ``RolloutLayout``, reported by its vLLM worker. Only single-node plain TP
-        replicas are described; anything else is ``None``.
+        """This worker's ``RolloutLayout``, reported by its vLLM worker. Only plain TP replicas are
+        described; anything else is ``None``.
 
-        Every rollout worker needs its own layout, not only the one holding the server handle, so
-        each asks the replica's server and picks its entry from the per-worker ``collective_rpc``
-        results, which are ordered by rank within the replica.
+        The server holder asks the replica's vLLM workers once; each sends its layout back over
+        this worker's ``zmq_handle``, so every rollout worker gets the layout of the vLLM worker
+        it feeds weights to.
         """
         from verl.workers.rollout.base import RolloutLayout
 
         cfg = self.config
         if self._pd_role is not None or cfg.data_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
             return None
-        if self.server_handle is None:
+        ipc_path = self.zmq_handle[len("ipc://") :]
+        try:
+            os.remove(ipc_path)
+        except OSError:
+            pass
+        sock = zmq.asyncio.Context.instance().socket(zmq.REP)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind(self.zmq_handle)
+
+        async def receive() -> dict:
+            layout = await sock.recv_pyobj()
+            # ack before awaiting the RPC: it only returns once every vLLM worker got its ack
+            await sock.send(b"")
+            return layout
+
+        try:
+            future = await self._execute_method(
+                "send_weight_ownership", non_block=True, kwargs={"timeout_s": _LAYOUT_TIMEOUT_S}
+            )
+            waits = [receive()] if future is None else [receive(), future]
             try:
-                handle = ray.get_actor(f"{self._get_server_name_prefix()}server_{self.replica_rank}_0")
-            except ValueError:
-                logger.warning(f"get_weight_ownership: no server for replica {self.replica_rank}")
-                return None
-        else:
-            handle = self.server_handle
-        results = await handle.collective_rpc.remote("get_weight_ownership")
-        if not results or len(results) != cfg.tensor_model_parallel_size:
-            # a multi-node replica: the other nodes' workers are not reachable through this server
-            logger.warning(f"get_weight_ownership: {len(results or [])} vLLM workers on the replica's server")
-            return None
-        return RolloutLayout.from_dict(results[self.rollout_rank])
+                layout, *_ = await asyncio.wait_for(asyncio.gather(*waits), _LAYOUT_TIMEOUT_S)
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    f"get_weight_ownership: no layout from the vLLM worker on {self.zmq_handle} in {_LAYOUT_TIMEOUT_S}s"
+                ) from e
+        finally:
+            sock.close()
+            try:
+                os.remove(ipc_path)
+            except OSError:
+                pass
+        return RolloutLayout.from_dict(layout)
 
     @torch.no_grad()
     async def update_weights(

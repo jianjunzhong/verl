@@ -468,6 +468,22 @@ class vLLMColocateWorkerExtension:
                 out["slices"] = plan.slices
         return out
 
+    def send_weight_ownership(self, timeout_s: float) -> None:
+        """Send :meth:`get_weight_ownership` to the rollout worker on this worker's ZMQ handle."""
+        import zmq
+
+        layout = self.get_weight_ownership()
+        sock = zmq.Context.instance().socket(zmq.REQ)
+        sock.setsockopt(zmq.SNDTIMEO, int(timeout_s * 1000))
+        sock.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(self._get_zmq_handle())
+        try:
+            sock.send_pyobj(layout)
+            sock.recv()
+        finally:
+            sock.close()
+
     def _m2n_receivable(self) -> bool:
         """Plain bf16 weights on one pipeline stage: anything else needs the loader's conversions."""
         try:
