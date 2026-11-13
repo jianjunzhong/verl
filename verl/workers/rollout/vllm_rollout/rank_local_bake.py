@@ -16,10 +16,12 @@
 With it the ``sharded_nixl`` trainer sends a TP rank only its own box of a tensor. Instead of
 per-model rules, a dry run of ``model.load_weights`` feeds each checkpoint name as a storage-less
 fake tensor that only records ``narrow`` calls, and catches the loader's final ``copy_``. A name
-whose loader copied exactly one strict sub-box into exactly one parameter view gets a ``slices``
-entry (advertised in ``RolloutLayout.slices``) and a :class:`Scatter` (where a received box lands).
-Every other name (copied whole, several copies, more than 2 dims, any other op on the weight,
-loader error) is sent full and goes through ``load_weights``.
+whose loader copied exactly one box into exactly one parameter view gets a ``slices`` entry
+(advertised in ``RolloutLayout.slices``) and a :class:`Scatter` (where a received box lands). The
+box is the whole tensor for an expert an expert-parallel rank keeps, whose place is one row of a
+FusedMoE weight; a name copied whole into a parameter of its own has nothing to place. Every other
+name (several copies, more than 2 dims, any other op on the weight, loader error) is sent full and
+goes through ``load_weights``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 
 import torch
@@ -37,18 +40,25 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass(frozen=True)
 class Scatter:
-    """Where a received box goes: ``param.data.as_strided(shape, stride, param.storage_offset() + offset)``."""
+    """Where a received box goes: ``param.data.as_strided(shape, stride, param.storage_offset() + offset)``.
+
+    ``pshape`` is the parameter's shape when the plan was baked; a parameter that no longer has it
+    (a MoE layer staged out of its kernel layout) is left to the loader. ``None``: not checked.
+    """
 
     param: str
     offset: int
     shape: tuple[int, ...]
     stride: tuple[int, ...]
+    pshape: tuple[int, ...] | None = None
 
 
 @dataclass
 class RankLocalPlan:
     slices: dict[str, dict] = field(default_factory=dict)
     scatters: dict[str, Scatter] = field(default_factory=dict)
+    # (layer prefix, stacked kind, key) -> lowest expert this rank keeps, indexed on first use
+    first_experts: dict[tuple[str, str, str], int] | None = None
 
 
 class _Unsupported(RuntimeError):
@@ -179,11 +189,18 @@ def bake(model: torch.nn.Module, model_path: str) -> RankLocalPlan:
         lens = tuple(n for _, n in box)
         owner = owners.get(dest.untyped_storage().data_ptr())
         # the trainer's box planner cuts at most 2-D tensors (e.g. not stacked 3-D experts)
-        if owner is None or tuple(dest.shape) != lens or list(lens) == shape or len(shape) > 2:
+        if owner is None or tuple(dest.shape) != lens or len(shape) > 2:
             continue
         pname, p = owner
+        # a tensor the loader copied whole still has a place when it is one slot of a larger
+        # parameter: an expert-parallel rank keeps whole experts as rows of its FusedMoE weight,
+        # and the stack of those rows is what the trainer cuts (see stacked_scatter)
+        if list(lens) == shape and dest.numel() == p.numel():
+            continue
         plan.slices[name] = {"full_shape": shape, "box": [list(b) for b in box]}
-        plan.scatters[name] = Scatter(pname, dest.storage_offset() - p.storage_offset(), lens, tuple(dest.stride()))
+        plan.scatters[name] = Scatter(
+            pname, dest.storage_offset() - p.storage_offset(), lens, tuple(dest.stride()), tuple(p.shape)
+        )
     logger.info(
         "rank-local bake: %d names sliced, %d unsupported%s",
         len(plan.slices),
@@ -193,10 +210,28 @@ def bake(model: torch.nn.Module, model_path: str) -> RankLocalPlan:
     return plan
 
 
+_EXPERT = re.compile(r"^(?P<prefix>.+)\.mlp\.experts\.(?P<e>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.(?P<key>\w+)$")
+
+
+def _first_experts(plan: RankLocalPlan) -> dict[tuple[str, str, str], int]:
+    """Per layer and stacked kind, the lowest expert this rank has a place for."""
+    if plan.first_experts is None:
+        plan.first_experts = {}
+        for n in plan.scatters:
+            m = _EXPERT.match(n)
+            if m is None:
+                continue
+            kind = "down_proj" if m["proj"] == "down_proj" else "gate_up_proj"
+            k, e = (m["prefix"], kind, m["key"]), int(m["e"])
+            plan.first_experts[k] = min(e, plan.first_experts.get(k, e))
+    return plan.first_experts
+
+
 def stacked_scatter(plan: RankLocalPlan, name: str, local_shape: tuple[int, ...]) -> Scatter | None:
     """The view a stacked expert box (``nccl_m2n_plan`` stacked names) of ``local_shape`` lands in,
-    if the per-expert boxes of its rows tile one parameter contiguously in row order (as FusedMoE's
-    ``w13_weight`` / ``w2_weight`` without expert parallelism); ``None`` otherwise."""
+    if the per-expert boxes of its rows tile one parameter contiguously in row order (FusedMoE's
+    ``w13_weight`` / ``w2_weight``, whose rows are the whole model's experts without expert
+    parallelism and this rank's run of them with it); ``None`` otherwise."""
     from verl.checkpoint_engine.nccl_m2n_plan import expert_names, stacked_kind
 
     sk = stacked_kind(name)
@@ -204,18 +239,21 @@ def stacked_scatter(plan: RankLocalPlan, name: str, local_shape: tuple[int, ...]
         return None
     prefix, kind = sk
     per = 2 if kind == "gate_up_proj" else 1
-    rows = [n for e in range(local_shape[0] // per) for n in expert_names(prefix, kind, e)]
+    e0 = _first_experts(plan).get((prefix, kind, "weight"))
+    if e0 is None:
+        return None
+    rows = [n for e in range(e0, e0 + local_shape[0] // per) for n in expert_names(prefix, kind, e)]
     scs = [plan.scatters.get(n) for n in rows]
     row_shape = tuple(local_shape[1:])
     row_stride = (row_shape[1], 1)
     step = row_shape[0] * row_shape[1]
-    first = scs[0]
+    head = scs[0]
     for r, sc in enumerate(scs):
-        if sc is None or sc.param != first.param or sc.shape != row_shape or sc.stride != row_stride:
+        if sc is None or sc.param != head.param or sc.shape != row_shape or sc.stride != row_stride:
             return None
-        if sc.offset != first.offset + r * step:
+        if sc.offset != head.offset + r * step:
             return None
-    return Scatter(first.param, first.offset, tuple(local_shape), (step, *row_stride))
+    return Scatter(head.param, head.offset, tuple(local_shape), (step, *row_stride), head.pshape)
 
 
 def apply(model: torch.nn.Module, plan: RankLocalPlan, weights):
@@ -231,5 +269,8 @@ def apply(model: torch.nn.Module, plan: RankLocalPlan, weights):
             rest.append((name, t))
             continue
         p = params[sc.param]
+        if sc.pshape is not None and tuple(p.shape) != sc.pshape:
+            rest.append((name, t))
+            continue
         p.data.as_strided(sc.shape, sc.stride, p.storage_offset() + sc.offset).copy_(t)
     return rest

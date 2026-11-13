@@ -446,11 +446,22 @@ class vLLMColocateWorkerExtension:
         worker_update_info["zmq_handle"] = self._get_zmq_handle()
         self.update_weights(worker_update_info)
 
+    def _replica_place(self) -> tuple[int, int]:
+        """``(ranks of this worker's replica, this worker's index in it)``, DP-major and TP-minor:
+        the order of vLLM's EP group, so an expert-parallel replica is one contiguous mesh."""
+        from vllm.distributed import parallel_state as ps
+
+        pc = self.model_runner.vllm_config.parallel_config
+        tp = int(pc.tensor_parallel_size)
+        dp = int(getattr(pc, "data_parallel_size", 1) or 1)
+        dp_rank = int(getattr(pc, "data_parallel_rank", 0) or 0)
+        return dp * tp, dp_rank * tp + int(ps.get_tensor_model_parallel_rank())
+
     def get_weight_ownership(self) -> dict:
         """This worker's place in its replica as a ``RolloutLayout`` dict.
 
         Where the worker can receive ``nccl_m2n`` transfers itself it lists that wire format, plus
-        the rank-local ``slices`` it keeps of each HF tensor (TP > 1, from ``rank_local_bake``).
+        the rank-local ``slices`` it keeps of each HF tensor (TP or EP, from ``rank_local_bake``).
         """
         from vllm.distributed import parallel_state as ps
 
@@ -458,9 +469,14 @@ class vLLMColocateWorkerExtension:
         out = {
             "tp_size": int(pc.tensor_parallel_size),
             "tp_rank": int(ps.get_tensor_model_parallel_rank()),
+            "dp_size": int(getattr(pc, "data_parallel_size", 1) or 1),
+            "dp_rank": int(getattr(pc, "data_parallel_rank", 0) or 0),
             "pp_size": int(pc.pipeline_parallel_size),
             "pp_rank": int(ps.get_pp_group().rank_in_group) if pc.pipeline_parallel_size > 1 else 0,
         }
+        if getattr(pc, "enable_expert_parallel", False):
+            ep = ps.get_ep_group()
+            out["ep_size"], out["ep_rank"] = int(ep.world_size), int(ep.rank_in_group)
         if self._m2n_receivable():
             out["wire_formats"] = ["named_tensors", "nccl_m2n"]
             plan = self._get_rank_local_plan()
@@ -502,16 +518,17 @@ class vLLMColocateWorkerExtension:
     def _get_rank_local_plan(self):
         """The rank-local plan, baked on the first call; ``None`` where boxes cannot be used.
 
-        Plain bf16 TP only: quantized weights are converted on load, LoRA syncs adapters, an MTP
-        drafter loads the same names again, and the bake does not handle PP. Under EP each resident
-        expert is loaded whole, so experts get no box.
+        Plain bf16 TP and EP only: quantized weights are converted on load, LoRA syncs adapters, an
+        MTP drafter loads the same names again, and the bake does not handle PP. Under EP a
+        resident expert is loaded whole, so its box is the whole per-expert tensor and only the
+        stacked tensor of the layer is cut (on the expert dim).
         """
         if not hasattr(self, "_rank_local_plan"):
             self._rank_local_plan = None
             cfg = self.model_runner.vllm_config
             pc = cfg.parallel_config
             if (
-                pc.tensor_parallel_size > 1
+                (pc.tensor_parallel_size > 1 or getattr(pc, "enable_expert_parallel", False))
                 and pc.pipeline_parallel_size == 1
                 and cfg.quant_config is None
                 and cfg.lora_config is None
@@ -523,17 +540,16 @@ class vLLMColocateWorkerExtension:
                 self._rank_local_plan = rank_local_bake.bake(self.model_runner.model, cfg.model_config.model)
         return self._rank_local_plan
 
-    def _m2n_replica_slices(self) -> list:
-        """Every TP rank's ``slices`` in rank order (the destination side of the M2N plan), gathered once."""
-        if not hasattr(self, "_m2n_slices"):
-            from vllm.distributed import parallel_state as ps
+    def _m2n_replica_slices(self, update_info: dict) -> list:
+        """Every replica rank's ``slices`` in replica order (the destination side of the M2N plan).
 
-            plan = self._get_rank_local_plan()
-            mine = plan.slices if plan is not None and plan.slices else None
-            group = ps.get_tp_group()
-            out = [None] * group.world_size
-            torch.distributed.all_gather_object(out, mine, group=group.cpu_group)
-            self._m2n_slices = out
+        Sent by the checkpoint engine worker on the first update of a replica and kept: the ranks
+        of a DP replica sit in different engine cores, so they cannot gather it among themselves.
+        """
+        if update_info.get("slices") is not None:
+            self._m2n_slices = update_info["slices"]
+        if getattr(self, "_m2n_slices", None) is None:
+            raise RuntimeError("nccl_m2n: this worker never received its replica's rank layouts")
         return self._m2n_slices
 
     def update_weights_from_m2n(self, update_info: dict) -> dict:
@@ -543,7 +559,6 @@ class vLLMColocateWorkerExtension:
         received into staging buffers and loaded."""
         import time
 
-        from vllm.distributed import parallel_state as ps
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import M2NReceiver
@@ -561,7 +576,7 @@ class vLLMColocateWorkerExtension:
         model = self.model_runner.model
         plan = self._get_rank_local_plan()
         reply = pickle.loads(update_info["reply"])
-        rx.sync(reply, self._m2n_replica_slices(), int(ps.get_tensor_model_parallel_rank()))
+        rx.sync(reply, self._m2n_replica_slices(update_info), self._replica_place()[1])
 
         for m in self._iter_all_models():
             patch_vllm_moe_model_weight_loader(m)
@@ -577,7 +592,7 @@ class vLLMColocateWorkerExtension:
                 if sc is None or sc.shape != it.dst.local_shape:
                     return None
                 p = params[sc.param]
-                if str(p.dtype) != f"torch.{it.dtype}":
+                if str(p.dtype) != f"torch.{it.dtype}" or (sc.pshape is not None and tuple(p.shape) != sc.pshape):
                     return None
                 view = p.data.as_strided(sc.shape, sc.stride, p.storage_offset() + sc.offset)
                 return view if view.is_contiguous() else None

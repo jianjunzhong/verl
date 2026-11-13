@@ -33,7 +33,9 @@ class RolloutLayout:
     ownership-aware checkpoint engines (``sharded_nixl``) send it only those. Plain Python
     fields: it crosses Ray calls as a dict.
 
-    * ``tp_*``, ``pp_*``, ``ep_*``: the worker's place in the inference parallel layout.
+    * ``tp_*``, ``dp_*``, ``pp_*``, ``ep_*``: the worker's place in the inference parallel layout.
+      A replica's ranks are ordered DP-major, TP-minor (``dp_rank * tp_size + tp_rank``), as
+      vLLM orders its EP group.
     * ``layer_range``: ``(start, end)`` decoder layers of this pipeline stage (``None`` = all).
     * ``local_experts``: ``{layer_idx: [global expert ids]}`` routed experts on this worker.
     * ``wire_formats``: what ``receive_weights`` accepts: ``named_tensors`` (full HF tensors) and
@@ -46,6 +48,8 @@ class RolloutLayout:
 
     tp_size: int = 1
     tp_rank: int = 0
+    dp_size: int = 1
+    dp_rank: int = 0
     pp_size: int = 1
     pp_rank: int = 0
     ep_size: int = 1

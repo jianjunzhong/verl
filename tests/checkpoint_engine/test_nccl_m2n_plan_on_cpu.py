@@ -86,6 +86,54 @@ def test_sharded_destination_needs_every_rank_to_agree():
     assert build_channel_plan(man, other)[0].dst.shard_dim is None
 
 
+def test_data_parallel_destination_is_a_replicated_mesh():
+    """A DP x TP replica: every DP rank asks for the same TP boxes, so the boxes repeat."""
+    man = _manifests(("q", (8, 4), 0))
+    tp2 = _slices("q", (8, 4), 2, 0)
+    dst = build_channel_plan(man, tp2 + tp2)[0].dst
+    assert dst == Side(2, 4, 0, (4, 4), repl=2)
+    assert dst.shard_n == 2
+    # the boxes alone say how the ranks repeat: TP4 over one DP rank is a 4-way split
+    tp4 = _slices("q", (8, 4), 4, 0)
+    assert build_channel_plan(man, tp4)[0].dst == Side(2, 4, 0, (2, 4), repl=1)
+    # a replicated side ignores repl: every rank takes the whole tensor
+    assert build_channel_plan(man, tp2 + tp2[::-1])[0].dst == Side(2, 4, None, (8, 4))
+
+
+def test_expert_parallel_destination_cuts_the_stack_on_the_expert_dim():
+    E, inter, hidden, pre = 8, 6, 4, "model.layers.0"
+    gu, dn = f"{pre}.mlp.experts.gate_up_proj", f"{pre}.mlp.experts.down_proj"
+    man = _manifests((gu, (2 * E, inter, hidden), 0), (dn, (E, hidden, inter), 0))
+
+    def ep_slices(ep):
+        """Each rank keeps whole experts: the boxes of its run, the rest of the layer missing."""
+        out = []
+        for r in range(ep):
+            sl = {}
+            for e in range(r * E // ep, (r + 1) * E // ep):
+                base = f"{pre}.mlp.experts.{e}."
+                for p in ("gate_proj", "up_proj"):
+                    sl[base + p + ".weight"] = {"full_shape": [inter, hidden], "box": [[0, inter], [0, hidden]]}
+                sl[base + "down_proj.weight"] = {"full_shape": [hidden, inter], "box": [[0, hidden], [0, inter]]}
+            out.append(sl)
+        return out
+
+    by = {it.name: it for it in build_channel_plan(man, ep_slices(4))}
+    assert by[gu].dst == Side(2, 4, 0, (2 * E // 4, inter, hidden), repl=1)
+    assert by[dn].dst == Side(2, 4, 0, (E // 4, hidden, inter), repl=1)
+    # rank 2 of 4 receives experts 4 and 5
+    t = torch.arange(4 * inter * hidden).view(4, inter, hidden)
+    assert [n for n, _ in unstack(by[gu], t, rank=2)] == [
+        f"{pre}.mlp.experts.{e}.{p}.weight" for e in (4, 5) for p in ("gate_proj", "up_proj")
+    ]
+
+    # a rank holding half an expert (an uneven split): the stack goes full
+    uneven = ep_slices(4)
+    moved = f"{pre}.mlp.experts.2.gate_proj.weight"
+    uneven[0][moved] = uneven[1].pop(moved)
+    assert build_channel_plan(man, uneven)[0].dst.shard_dim is None
+
+
 def test_subset_holders_and_errors():
     # tensor held by senders 1..2 only (e.g. a later stage's piece), sharded over them
     a = _pieces("x", (4, 2), 2, 0)
@@ -167,6 +215,14 @@ def test_stacked_scatter_needs_contiguous_expert_rows():
             plan.scatters[f"{pre}.mlp.experts.{e}.{p}.weight"] = Scatter("w13", off, (rows, hidden), (hidden, 1))
     sc = stacked_scatter(plan, gu, (2 * E, rows, hidden))
     assert sc == Scatter("w13", 0, (2 * E, rows, hidden), (rows * hidden, hidden, 1))
+
+    # expert parallelism: the rows this rank has a place for are experts 2..4 of the model
+    local = RankLocalPlan()
+    for e in range(2, 2 + E):
+        for j, p in enumerate(("gate_proj", "up_proj")):
+            off = (2 * (e - 2) + j) * rows * hidden
+            local.scatters[f"{pre}.mlp.experts.{e}.{p}.weight"] = Scatter("w13", off, (rows, hidden), (hidden, 1))
+    assert stacked_scatter(local, gu, (2 * E, rows, hidden)) == sc
     # up before gate (a swapped kernel layout): no single view
     a, b = (f"{pre}.mlp.experts.1.{p}.weight" for p in ("gate_proj", "up_proj"))
     plan.scatters[a], plan.scatters[b] = plan.scatters[b], plan.scatters[a]

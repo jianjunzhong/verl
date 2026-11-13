@@ -22,9 +22,13 @@ the replica's rollout ranks in TP order. Every tensor becomes a :class:`PlanItem
   piece). The holders must be a contiguous run of senders; their boxes are either all the full
   tensor (``Replicate``) or an even split on one dim in sender order (``Shard(d)``). M2N has one
   local shape per side, so uneven splits must be resolved by the source (gather that tensor).
-* destination: from the replica's ``RolloutLayout.slices`` boxes. A tensor is ``Shard(d)`` only if
-  every rank's box is the even split on ``d`` in TP order, otherwise ``Replicate`` (every rank
-  receives the full tensor and its loader slices it).
+* destination: from the replica's ``RolloutLayout.slices`` boxes. The boxes of the replica's ranks
+  (in rollout order, see :class:`Side`) may repeat with a period ``p``: the ranks then form a
+  ``(n / p, p)`` mesh whose first axis is replicated, and the tensor is ``Shard(d)`` on the second
+  if the first ``p`` boxes are the even split on ``d``. A rollout with data parallelism lands here
+  (dense weights repeat once per DP rank, expert stacks are cut over every rank, ``p = n``); a
+  tensor whose boxes are no such pattern is ``Replicate`` (every rank receives the full tensor and
+  its loader slices it).
 
 The plan only depends on the manifests and layouts, so trainer and rollout ranks build it on their
 own and compare a digest instead of shipping per-weight metadata on every step.
@@ -92,13 +96,23 @@ class Piece:
 
 @dataclass(frozen=True)
 class Side:
-    """One side of a reshard: ranks ``[start, start + n)`` of the channel comm."""
+    """One side of a reshard: ranks ``[start, start + n)`` of the channel comm, as the row-major
+    ``(repl, n / repl)`` mesh M2N takes. The first axis is replicated and the second carries
+    ``shard_dim``, so rank ``start + i * (n / repl) + j`` holds shard ``j`` for every ``i``.
+    ``repl`` is only meaningful when the side is sharded; a ``Replicate`` side gives every one of
+    its ``n`` ranks the full tensor."""
 
     start: int
     n: int
     # None: every rank of the side holds the full tensor
     shard_dim: Optional[int]
     local_shape: tuple[int, ...]
+    repl: int = 1
+
+    @property
+    def shard_n(self) -> int:
+        """Ranks of the sharded mesh axis (1 when the side is replicated)."""
+        return self.n // self.repl if self.shard_dim is not None else 1
 
 
 @dataclass(frozen=True)
@@ -190,8 +204,8 @@ def build_channel_plan(
         src_dim = None if sd < 0 else sd
         src = Side(ranks[0], len(ranks), src_dim, _local(shape, src_dim, len(ranks)))
 
-        dst_dim = _dst_dim(name, shape, dst_slices)
-        dst = Side(S, D, dst_dim, _local(shape, dst_dim, D))
+        repl, dst_dim = _dst_placement(name, shape, dst_slices)
+        dst = Side(S, D, dst_dim, _local(shape, dst_dim, D // repl), repl)
         if src_dim is not None and (dst_dim is None or dst_dim != src_dim) and src.n > MAX_SOURCES_PER_DST:
             raise ValueError(
                 f"{name}: {src.n} source shards feed every destination shard, M2N allows {MAX_SOURCES_PER_DST}"
@@ -200,15 +214,29 @@ def build_channel_plan(
     return items
 
 
-def _dst_dim(name: str, shape: tuple[int, ...], dst_slices: Sequence[Optional[dict]]) -> Optional[int]:
+def _dst_placement(
+    name: str, shape: tuple[int, ...], dst_slices: Sequence[Optional[dict]]
+) -> tuple[int, Optional[int]]:
+    """``(replicated mesh ranks, shard dim)`` of the destination; ``(1, None)`` to send it full.
+
+    The period of the boxes is read off the boxes themselves rather than taken from the rollout's
+    parallel sizes: what each rank asked for is all the reshard has to match, and both sides derive
+    it from the same layouts. Boxes that repeat with a period shorter than ``n`` cannot be an even
+    ``n``-way split (its offsets are all different), so the shortest period is the only candidate.
+    """
     boxes = []
     for slices in dst_slices:
         entry = (slices or {}).get(name) or _stacked_entry(name, shape, slices or {})
         if entry is None or tuple(entry["full_shape"]) != shape:
-            return None
+            return 1, None
         boxes.append((tuple(int(b[0]) for b in entry["box"]), tuple(int(b[1]) for b in entry["box"])))
-    sd = _even_split(boxes, shape) if boxes else None
-    return None if sd is None or sd < 0 else sd
+    n = len(boxes)
+    if not n:
+        return 1, None
+    period = next(p for p in range(1, n + 1) if n % p == 0 and all(boxes[k] == boxes[k % p] for k in range(n)))
+    sd = _even_split(boxes[:period], shape)
+    # every box full, or no even split on one dim: every rank takes the whole tensor
+    return (1, None) if sd is None or sd < 0 else (n // period, sd)
 
 
 def stacked_kind(name: str) -> Optional[tuple[str, str]]:
@@ -225,17 +253,21 @@ def expert_names(prefix: str, kind: str, e: int) -> list[str]:
 
 
 def _stacked_entry(name: str, shape: tuple[int, ...], slices: dict) -> Optional[dict]:
-    """The box of a stacked expert tensor on one rollout rank, if every expert's per-expert boxes are
-    the same (each expert sliced alike, as TP does); ``None`` (full) otherwise."""
+    """The box of a stacked expert tensor on one rollout rank: the rows of the experts it keeps,
+    cut like their per-expert boxes. The experts of the rank must be a contiguous run sliced alike
+    (expert parallelism keeps a run of whole experts, TP keeps every expert cut the same way);
+    ``None`` (full) otherwise."""
     sk = stacked_kind(name)
     if sk is None or len(shape) != 3:
         return None
     prefix, kind = sk
     n_rows = 2 if kind == "gate_up_proj" else 1
-    box = None
+    box, experts = None, []
     for e in range(shape[0] // n_rows):
-        for n in expert_names(prefix, kind, e):
-            entry = slices.get(n)
+        entries = [slices.get(n) for n in expert_names(prefix, kind, e)]
+        if all(entry is None for entry in entries):
+            continue
+        for entry in entries:
             if entry is None or tuple(entry["full_shape"]) != tuple(shape[1:]):
                 return None
             b = tuple((int(s), int(c)) for s, c in entry["box"])
@@ -243,7 +275,11 @@ def _stacked_entry(name: str, shape: tuple[int, ...], slices: dict) -> Optional[
                 box = b
             elif b != box:
                 return None
-    return {"full_shape": list(shape), "box": [[0, shape[0]], *[list(b) for b in box]]}
+        experts.append(e)
+    if not experts or experts != list(range(experts[0], experts[-1] + 1)):
+        return None
+    rows = [experts[0] * n_rows, len(experts) * n_rows]
+    return {"full_shape": list(shape), "box": [rows, *[list(b) for b in box]]}
 
 
 def unstack(item: PlanItem, tensor, rank: int) -> list[tuple[str, object]]:
@@ -254,7 +290,7 @@ def unstack(item: PlanItem, tensor, rank: int) -> list[tuple[str, object]]:
         return [(item.name, tensor)]
     prefix, kind = sk
     n_rows = 2 if kind == "gate_up_proj" else 1
-    first = rank * item.dst.local_shape[0] if item.dst.shard_dim == 0 else 0
+    first = (rank % item.dst.shard_n) * item.dst.local_shape[0] if item.dst.shard_dim == 0 else 0
     out = []
     for row in range(tensor.shape[0]):
         e, part = divmod(first + row, n_rows)

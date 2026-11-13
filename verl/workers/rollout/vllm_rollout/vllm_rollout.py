@@ -91,6 +91,7 @@ class ServerAdapter(BaseRollout):
             self.replica_rank = replica_rank
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
+        self.nnodes = max(rollout_world_size // local_world_size, 1)
 
         # Map each trainer rank to its co-located vLLM server so weight-update
         # IPC handles stay on the GPU where they were created. Offset math
@@ -213,17 +214,20 @@ class ServerAdapter(BaseRollout):
             await self.server_handle.sleep.remote()
 
     async def get_weight_ownership(self):
-        """This worker's ``RolloutLayout``, reported by its vLLM worker. Only plain TP replicas are
-        described; anything else is ``None``.
+        """This worker's ``RolloutLayout``, reported by its vLLM worker. Only TP and single-node DP
+        replicas are described; anything else is ``None``.
 
         The server holder asks the replica's vLLM workers once; each sends its layout back over
         this worker's ``zmq_handle``, so every rollout worker gets the layout of the vLLM worker
-        it feeds weights to.
+        it feeds weights to. With DP the one holder reaches every DP rank's workers: vLLM fans
+        ``collective_rpc`` out over all of its engine cores.
         """
         from verl.workers.rollout.base import RolloutLayout
 
         cfg = self.config
-        if self._pd_role is not None or cfg.data_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
+        # a multi-node DP replica would have to pair each node's workers with their own server
+        multi_node_dp = cfg.data_parallel_size > 1 and self.nnodes > 1
+        if self._pd_role is not None or multi_node_dp or cfg.pipeline_model_parallel_size != 1:
             return None
         ipc_path = self.zmq_handle[len("ipc://") :]
         try:

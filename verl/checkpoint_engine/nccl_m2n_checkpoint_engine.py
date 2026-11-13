@@ -218,7 +218,9 @@ def _desc(item: PlanItem, side: Side, buf: Optional[torch.Tensor]) -> DistTensor
     if side.shard_dim is None:
         mesh, placements = Mesh((side.n, 1), start_rank=side.start), [Replicate(), Replicate()]
     else:
-        mesh, placements = Mesh((1, side.n), start_rank=side.start), [Replicate(), Shard(side.shard_dim)]
+        # row-major: rank start + i * shard_n + j holds shard j of the i-th replica of the side
+        mesh = Mesh((side.repl, side.shard_n), start_rank=side.start)
+        placements = [Replicate(), Shard(side.shard_dim)]
     return DistTensor(buf, local_shape=side.local_shape, dtype=_dtype(item.dtype), mesh=mesh, placements=placements)
 
 
@@ -497,6 +499,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         # rollout
         self._rx: Optional[M2NReceiver] = None
         self._forwarded_digest: Optional[str] = None
+        self._slices_sent = False
 
     @property
     def wire_format(self) -> str:
@@ -525,6 +528,7 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         assert master is not None, "trainer rank 0 must be the nccl_m2n master"
         rollout = metadata[actor_wg_world_size:]
 
+        # a replica is its DP x TP ranks, in the DP-major, TP-minor order of vLLM's EP group
         groups: list[list[int]] = []
         for i, meta in enumerate(rollout):
             layout = meta["layout"]
@@ -534,13 +538,15 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
                 )
             if layout["pp_size"] != 1:
                 raise NotImplementedError("nccl_m2n does not support rollout pipeline parallelism yet")
-            if layout["tp_rank"] == 0:
+            place = layout.get("dp_rank", 0) * layout["tp_size"] + layout["tp_rank"]
+            if place == 0:
                 groups.append([])
-            if not groups or len(groups[-1]) != layout["tp_rank"]:
-                raise ValueError(f"nccl_m2n: rollout worker {i} is out of TP order ({layout['tp_rank']})")
+            if not groups or len(groups[-1]) != place:
+                raise ValueError(f"nccl_m2n: rollout worker {i} is out of replica order ({place})")
             groups[-1].append(i)
         for g in groups:
-            if len(g) != rollout[g[0]]["layout"]["tp_size"]:
+            layout = rollout[g[0]]["layout"]
+            if len(g) != layout["tp_size"] * layout.get("dp_size", 1):
                 raise ValueError(f"nccl_m2n: incomplete rollout replica {g}")
 
         update = uuid.uuid4().hex
@@ -583,6 +589,9 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
         if role == "trainer":
             self._replicas = replicas
         else:
+            # the layouts of a replica are baked once per process, so its slices only change
+            # when the replica itself does
+            self._slices_sent = self._slices_sent and replica == self._replica
             self._replica, self._replica_rank, self._slices = replica, replica_rank, slices
 
     def finalize(self):
@@ -778,17 +787,20 @@ class NCCLM2NCheckpointEngine(CheckpointEngine):
             forward = dict(rep)
             if self._forwarded_digest != rep["manifest_digest"]:
                 forward["manifests"] = self._rx.manifests
-            yield (
-                WIRE_FORMAT,
-                {
-                    # pickled: vLLM's collective_rpc serializes dataclasses (the manifests) as dicts
-                    "reply": pickle.dumps(forward),
-                    "bucket_size": self.bucket_size,
-                    "group_bytes": self.group_bytes,
-                    "timeout_s": self.sync_timeout_s,
-                },
-            )
+            info = {
+                # pickled: vLLM's collective_rpc serializes dataclasses (the manifests) as dicts
+                "reply": pickle.dumps(forward),
+                "bucket_size": self.bucket_size,
+                "group_bytes": self.group_bytes,
+                "timeout_s": self.sync_timeout_s,
+            }
+            if not self._slices_sent:
+                # every rank's boxes, in replica order: the workers build the plan from them and
+                # cannot gather them themselves (a DP replica spans several engine cores)
+                info["slices"] = self._slices
+            yield (WIRE_FORMAT, info)
             self._forwarded_digest = rep["manifest_digest"]
+            self._slices_sent = True
             return
 
         self._rx.sync(rep, self._slices, self._replica_rank)
